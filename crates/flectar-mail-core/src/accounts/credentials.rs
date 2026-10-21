@@ -35,6 +35,9 @@ pub enum Slot {
     /// CardDAV app password. Kept separate because a user may configure
     /// different DAV providers for calendars and contacts.
     CarddavPassword,
+    /// Siftmail: shared proxy password, keyed by
+    /// [`crate::net::proxy::credential_key`] (never by an account id).
+    ProxyPassword,
 }
 
 impl Slot {
@@ -49,6 +52,7 @@ impl Slot {
             Slot::AiApiKey => "ai_api_key",
             Slot::CaldavPassword => "caldav_password",
             Slot::CarddavPassword => "carddav_password",
+            Slot::ProxyPassword => "proxy_password",
         }
     }
 }

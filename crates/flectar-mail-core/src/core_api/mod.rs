@@ -12,6 +12,7 @@ mod contacts;
 mod labels;
 mod notifications;
 mod outbox;
+mod proxies;
 mod search_ask;
 mod settings;
 mod snippets;

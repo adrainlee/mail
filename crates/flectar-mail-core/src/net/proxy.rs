@@ -55,6 +55,149 @@ pub struct ProxyConfig {
     pub remote_dns: bool,
 }
 
+/// How an account picks its egress.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProxyMode {
+    /// Always connect directly, even when a global proxy is configured.
+    Direct,
+    /// Use the app-wide default proxy (direct when none is set).
+    Global,
+    /// Use the account's own `proxy_id`.
+    Custom,
+}
+
+pub fn effective_mode(settings: &crate::models::MailConnectionSettings) -> ProxyMode {
+    settings
+        .proxy_mode
+        .unwrap_or(if settings.proxy_id.is_some() {
+            ProxyMode::Custom
+        } else {
+            ProxyMode::Global
+        })
+}
+
+const GLOBAL_KEY: &str = "siftmail.global_proxy_id";
+
+pub fn global_proxy_id(conn: &Connection) -> Result<Option<i64>> {
+    let v: Option<String> = conn
+        .query_row(
+            "SELECT value FROM app_settings WHERE key = ?1",
+            params![GLOBAL_KEY],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(v.and_then(|v| v.parse().ok()))
+}
+
+pub fn set_global_proxy_id(conn: &Connection, id: Option<i64>) -> Result<()> {
+    match id {
+        Some(id) => conn.execute(
+            "INSERT INTO app_settings (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![GLOBAL_KEY, id.to_string()],
+        )?,
+        None => conn.execute(
+            "DELETE FROM app_settings WHERE key = ?1",
+            params![GLOBAL_KEY],
+        )?,
+    };
+    Ok(())
+}
+
+/// Resolve the proxy an account's connections must use, with its password
+/// taken from the in-memory cache filled from the credential store.
+pub fn resolve_for(
+    conn: &Connection,
+    settings: &crate::models::MailConnectionSettings,
+) -> Result<Option<ProxyConfig>> {
+    let id = match effective_mode(settings) {
+        ProxyMode::Direct => None,
+        ProxyMode::Global => global_proxy_id(conn)?,
+        ProxyMode::Custom => settings.proxy_id,
+    };
+    let Some(id) = id else { return Ok(None) };
+    Ok(get(conn, id)?.map(|mut p| {
+        p.password = cached_password(p.id);
+        p
+    }))
+}
+
+// ---- secrets: passwords live in the OS credential store (Windows
+// Credential Manager via keyring); this cache only mirrors them in memory.
+
+/// Credential-store id for a proxy. Negative so it can never collide with an
+/// account id (whose `delete_all` would otherwise wipe it).
+pub fn credential_key(proxy_id: i64) -> i64 {
+    -1_000_000 - proxy_id
+}
+
+type Cache<K, V> = std::sync::LazyLock<std::sync::RwLock<std::collections::HashMap<K, V>>>;
+static PASSWORDS: Cache<i64, String> = std::sync::LazyLock::new(Default::default);
+static ACCOUNT_PROXIES: Cache<i64, ProxyConfig> = std::sync::LazyLock::new(Default::default);
+
+pub fn cache_password(proxy_id: i64, password: Option<String>) {
+    let mut m = PASSWORDS
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    match password.filter(|p| !p.is_empty()) {
+        Some(p) => m.insert(proxy_id, p),
+        None => m.remove(&proxy_id),
+    };
+}
+
+pub fn cached_password(proxy_id: i64) -> Option<String> {
+    PASSWORDS
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&proxy_id)
+        .cloned()
+}
+
+/// Remember the last resolved proxy per account, so HTTP paths that only
+/// know an account id (OAuth refresh) use the same egress as IMAP/SMTP.
+pub fn remember_account_proxy(account_id: i64, proxy: Option<ProxyConfig>) {
+    let mut m = ACCOUNT_PROXIES
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    match proxy {
+        Some(p) => m.insert(account_id, p),
+        None => m.remove(&account_id),
+    };
+}
+
+pub fn account_proxy(account_id: i64) -> Option<ProxyConfig> {
+    ACCOUNT_PROXIES
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&account_id)
+        .cloned()
+}
+
+/// Proxy URL for reqwest (`socks5h` keeps DNS on the proxy).
+pub fn reqwest_proxy(p: &ProxyConfig) -> Result<reqwest::Proxy> {
+    let scheme = match (p.kind, p.remote_dns) {
+        (ProxyKind::Socks5, true) => "socks5h",
+        (ProxyKind::Socks5, false) => "socks5",
+        (ProxyKind::HttpConnect, _) => "http",
+    };
+    let host = if p.host.contains(':') && !p.host.starts_with('[') {
+        format!("[{}]", p.host)
+    } else {
+        p.host.clone()
+    };
+    let mut url = reqwest::Url::parse(&format!("{scheme}://{host}:{}", p.port))
+        .map_err(|e| io_err("config", e))?;
+    if !p.username.is_empty() {
+        // Userinfo in the URL works for both SOCKS5 (RFC 1929) and HTTP
+        // (Proxy-Authorization: Basic); `Url` percent-encodes it.
+        url.set_username(&p.username).ok();
+        url.set_password(p.password.as_deref()).ok();
+    }
+    let proxy = reqwest::Proxy::all(url.as_str()).map_err(|e| io_err("config", e))?;
+    Ok(proxy)
+}
+
 fn yes() -> bool {
     true
 }
@@ -596,5 +739,102 @@ mod tests {
         assert!(!cols.contains("pass"));
         assert!(save(&conn, &cfg(ProxyKind::HttpConnect, 0)).is_err());
         assert!(delete(&conn, id).unwrap());
+    }
+
+    fn db() -> Connection {
+        let mut conn = Connection::open_in_memory().unwrap();
+        crate::db::migrations::run(&mut conn).unwrap();
+        conn
+    }
+
+    #[test]
+    fn modes_resolve_direct_global_custom() {
+        use crate::models::MailConnectionSettings;
+        let conn = db();
+        let a = save(&conn, &cfg(ProxyKind::Socks5, 1080)).unwrap();
+        let b = save(&conn, &cfg(ProxyKind::HttpConnect, 8080)).unwrap();
+        let mut s = MailConnectionSettings::default();
+        // Global with no global set = direct.
+        assert_eq!(resolve_for(&conn, &s).unwrap(), None);
+        set_global_proxy_id(&conn, Some(a)).unwrap();
+        assert_eq!(resolve_for(&conn, &s).unwrap().unwrap().id, a);
+        // M5 settings (proxy_id only) still mean custom.
+        s.proxy_id = Some(b);
+        assert_eq!(effective_mode(&s), ProxyMode::Custom);
+        assert_eq!(resolve_for(&conn, &s).unwrap().unwrap().id, b);
+        s.proxy_mode = Some(ProxyMode::Direct);
+        assert_eq!(resolve_for(&conn, &s).unwrap(), None);
+        set_global_proxy_id(&conn, None).unwrap();
+        assert_eq!(global_proxy_id(&conn).unwrap(), None);
+    }
+
+    #[test]
+    fn resolved_proxy_takes_password_from_cache_only() {
+        let conn = db();
+        let mut p = cfg(ProxyKind::Socks5, 1080);
+        p.username = "u".into();
+        let id = save(&conn, &p).unwrap();
+        let s = crate::models::MailConnectionSettings {
+            proxy_id: Some(id),
+            ..Default::default()
+        };
+        cache_password(id, Some("pw".into()));
+        assert_eq!(
+            resolve_for(&conn, &s).unwrap().unwrap().password.as_deref(),
+            Some("pw")
+        );
+        cache_password(id, None);
+        assert_eq!(resolve_for(&conn, &s).unwrap().unwrap().password, None);
+        assert!(credential_key(id) < 0);
+    }
+
+    #[test]
+    fn reqwest_proxy_urls() {
+        let mut p = cfg(ProxyKind::Socks5, 1080);
+        p.username = "a b".into();
+        p.password = Some("p@ss".into());
+        assert!(reqwest_proxy(&p).is_ok());
+        p.kind = ProxyKind::HttpConnect;
+        p.host = "::1".into();
+        assert!(reqwest_proxy(&p).is_ok());
+    }
+
+    /// OAuth token refresh goes through the account proxy (SOCKS5 with auth
+    /// and remote DNS: the host name is only resolvable by the proxy).
+    #[tokio::test]
+    async fn oauth_post_form_uses_proxy() {
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let web = l.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = l.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 4096];
+                    let _ = s.read(&mut buf).await;
+                    let body = r#"{"access_token":"t"}"#;
+                    let _ = s
+                        .write_all(
+                            format!(
+                                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                                body.len()
+                            )
+                            .as_bytes(),
+                        )
+                        .await;
+                });
+            }
+        });
+        let (port, seen) = socks5(Some(("u", "pw"))).await;
+        let mut p = cfg(ProxyKind::Socks5, port);
+        p.username = "u".into();
+        p.password = Some("pw".into());
+        let body = crate::oauth::tokens::post_form_via(
+            &format!("http://imap.example.test:{web}/token"),
+            &[("grant_type".into(), "refresh_token".into())],
+            Some(&p),
+        )
+        .await
+        .unwrap();
+        assert!(body.contains("access_token"));
+        assert_eq!(seen.lock().unwrap()[0], format!("imap.example.test:{web}"));
     }
 }

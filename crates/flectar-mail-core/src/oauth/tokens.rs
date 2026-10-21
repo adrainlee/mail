@@ -291,7 +291,8 @@ impl TokenProvider {
             form.push(("client_secret".to_string(), cs));
         }
 
-        let body = post_form(cfg.token_url, &form).await?;
+        let proxy = crate::net::proxy::account_proxy(account_id);
+        let body = post_form_via(cfg.token_url, &form, proxy.as_ref()).await?;
         let tok: TokenResponse = serde_json::from_str(&body).map_err(|_| {
             // invalid_grant / consent_required => the scope was never granted.
             if token_error_requires_reauth(&body) {
@@ -358,7 +359,8 @@ impl TokenProvider {
             form.push(("client_secret".to_string(), cs));
         }
 
-        let body = post_form(cfg.token_url, &form).await?;
+        let proxy = crate::net::proxy::account_proxy(account_id);
+        let body = post_form_via(cfg.token_url, &form, proxy.as_ref()).await?;
         let tok: TokenResponse = serde_json::from_str(&body).map_err(|_| {
             if token_error_requires_reauth(&body) {
                 CoreError::NeedsReauth
@@ -523,20 +525,44 @@ mod platform_marker_tests {
 /// proxy support and a hard deadline instead of waiting forever on a silent
 /// identity endpoint.
 pub async fn post_form(url: &str, form: &[(String, String)]) -> Result<String> {
+    post_form_via(url, form, None).await
+}
+
+fn oauth_client_builder() -> reqwest::ClientBuilder {
+    reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(15))
+        .timeout(std::time::Duration::from_secs(30))
+        .redirect(reqwest::redirect::Policy::none())
+        .user_agent(concat!("Flectar-Mail/", env!("CARGO_PKG_VERSION")))
+}
+
+/// [`post_form`] through an account's proxy (Siftmail): token refresh must
+/// leave through the same egress as the account's IMAP/SMTP traffic.
+pub async fn post_form_via(
+    url: &str,
+    form: &[(String, String)],
+    proxy: Option<&crate::net::proxy::ProxyConfig>,
+) -> Result<String> {
     const MAX_OAUTH_RESPONSE_BODY_BYTES: usize = 1024 * 1024;
+    let proxied;
     static HTTP: once_cell::sync::Lazy<std::result::Result<reqwest::Client, String>> =
         once_cell::sync::Lazy::new(|| {
-            reqwest::Client::builder()
-                .connect_timeout(std::time::Duration::from_secs(15))
-                .timeout(std::time::Duration::from_secs(30))
-                .redirect(reqwest::redirect::Policy::none())
-                .user_agent(concat!("Flectar-Mail/", env!("CARGO_PKG_VERSION")))
+            oauth_client_builder()
                 .build()
                 .map_err(|error| format!("OAuth HTTP client configuration failed: {error}"))
         });
-    let http = HTTP
-        .as_ref()
-        .map_err(|message| CoreError::Network(message.clone()))?;
+    let http = match proxy {
+        Some(p) => {
+            proxied = oauth_client_builder()
+                .proxy(crate::net::proxy::reqwest_proxy(p)?)
+                .build()
+                .map_err(|e| CoreError::Network(format!("OAuth HTTP client: {e}")))?;
+            &proxied
+        }
+        None => HTTP
+            .as_ref()
+            .map_err(|message| CoreError::Network(message.clone()))?,
+    };
     let response = http.post(url).form(form).send().await.map_err(|error| {
         if error.is_timeout() || error.is_connect() {
             CoreError::Offline

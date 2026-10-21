@@ -209,6 +209,14 @@ fn smtp_auth(auth: &SmtpAuth, username: &str) -> (Credentials, Vec<Mechanism>) {
     }
 }
 
+/// lettre's built-in transport dials TCP itself, so it can neither verify an
+/// imported certificate nor tunnel through an account proxy. Either case uses
+/// our own connection built on [`crate::net::proxy::connect_tcp`].
+pub(crate) fn needs_custom_connection(cfg: &AccountConfig) -> bool {
+    !cfg.settings.connection.trusted_certificate_pem.is_empty()
+        || cfg.settings.connection.proxy.is_some()
+}
+
 async fn imported_certificate_connection(
     cfg: &AccountConfig,
     auth: &SmtpAuth,
@@ -334,7 +342,7 @@ pub async fn send_raw(
         "smtp send_raw: connecting to relay",
     );
     let message = crate::mail_security::without_bcc_for_delivery(raw)?;
-    if cfg.settings.connection.trusted_certificate_pem.is_empty() {
+    if !needs_custom_connection(cfg) {
         build_transport(cfg, auth)?
             .send_raw(&envelope, &message)
             .await
@@ -352,7 +360,7 @@ pub async fn send_raw(
 
 /// Cheap connectivity/auth probe used by test_connection.
 pub async fn test_connection(cfg: &AccountConfig, auth: &SmtpAuth) -> Result<()> {
-    let ok = if cfg.settings.connection.trusted_certificate_pem.is_empty() {
+    let ok = if !needs_custom_connection(cfg) {
         build_transport(cfg, auth)?
             .test_connection()
             .await
