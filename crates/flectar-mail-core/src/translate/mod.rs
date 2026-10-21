@@ -8,7 +8,9 @@
 //! markup: translated text is HTML-escaped and only the original tags
 //! captured as placeholders are restored.
 
+pub mod lang;
 pub mod segment;
+pub mod split;
 pub mod store;
 
 pub use segment::{Block, BlockKind, SegmentOpts, Segmented, segment_html, segment_text};
@@ -33,6 +35,8 @@ pub struct TranslateConfig {
     pub confirm_chunks: usize,
     /// Price per 1k input tokens, for the estimate (optional).
     pub price_per_1k: Option<f64>,
+    /// Leave blocks already written in the target language untouched.
+    pub skip_same_language: bool,
 }
 
 impl Default for TranslateConfig {
@@ -44,6 +48,7 @@ impl Default for TranslateConfig {
             confirm_tokens: 8000,
             confirm_chunks: 20,
             price_per_1k: None,
+            skip_same_language: true,
         }
     }
 }
@@ -97,16 +102,34 @@ pub struct Estimate {
     pub input_tokens: usize,
     pub est_cost: Option<f64>,
     pub needs_confirmation: bool,
+    /// Detected language of the translatable text (ISO 639-1), if clear.
+    pub source_lang: Option<String>,
+    /// The mail is already in the target language; nothing to translate.
+    pub already_in_target: bool,
 }
 
 pub fn estimate(seg: &Segmented, cfg: &TranslateConfig) -> Estimate {
     let chunks = pack(&seg.blocks, cfg.chunk_budget);
     let input_tokens: usize = chunks.iter().map(|c| c.est_tokens).sum();
+    let sample: String = seg
+        .blocks
+        .iter()
+        .filter(|b| b.translatable)
+        .map(|b| b.source.as_str())
+        .take(40)
+        .collect::<Vec<_>>()
+        .join(" ");
+    let source_lang = lang::detect(&sample);
+    let already_in_target =
+        source_lang.is_some() && source_lang == lang::target_code(&cfg.target_lang);
     Estimate {
+        source_lang: source_lang.map(str::to_owned),
+        already_in_target,
         chunks: chunks.len(),
         input_tokens,
         est_cost: cfg.price_per_1k.map(|p| p * input_tokens as f64 / 1000.0),
-        needs_confirmation: input_tokens > cfg.confirm_tokens || chunks.len() > cfg.confirm_chunks,
+        needs_confirmation: !already_in_target
+            && (input_tokens > cfg.confirm_tokens || chunks.len() > cfg.confirm_chunks),
     }
 }
 
@@ -235,6 +258,17 @@ pub fn reassemble(seg: &Segmented, out: &HashMap<u32, String>) -> Reassembled {
 #[async_trait::async_trait]
 pub trait Translator: Send + Sync {
     async fn complete(&self, messages: Vec<ChatMessage>) -> Result<String>;
+    /// Streaming variant; `on_delta` receives text as it arrives. Defaults to
+    /// [`Translator::complete`] with a single delta.
+    async fn complete_stream(
+        &self,
+        messages: Vec<ChatMessage>,
+        on_delta: &(dyn for<'a> Fn(&'a str) + Send + Sync),
+    ) -> Result<String> {
+        let out = self.complete(messages).await?;
+        on_delta(&out);
+        Ok(out)
+    }
     fn model(&self) -> String;
 }
 
@@ -242,6 +276,13 @@ pub trait Translator: Send + Sync {
 impl Translator for crate::ai::AiConfig {
     async fn complete(&self, messages: Vec<ChatMessage>) -> Result<String> {
         crate::ai::chat(self, messages).await
+    }
+    async fn complete_stream(
+        &self,
+        messages: Vec<ChatMessage>,
+        on_delta: &(dyn for<'a> Fn(&'a str) + Send + Sync),
+    ) -> Result<String> {
+        crate::ai::chat_stream(self, messages, |d: &str| on_delta(d)).await
     }
     fn model(&self) -> String {
         self.model.clone()
@@ -267,9 +308,39 @@ pub fn block_hash(source: &str, lang: &str, model: &str) -> String {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TranslateEvent {
-    Progress { done: usize, total: usize },
-    Block { idx: u32, text: String },
+    Progress {
+        done: usize,
+        total: usize,
+    },
+    /// A block's finished translation (placeholders still in the text; use
+    /// [`reassemble`] / [`restore_block`] to render).
+    Block {
+        idx: u32,
+        text: String,
+    },
+    /// Streaming preview of one item while its chunk is still arriving.
+    /// Not validated; superseded by `Block`. For split paragraphs `idx` is
+    /// the block and `text` the pieces received so far.
+    Preview {
+        idx: u32,
+        text: String,
+    },
 }
+
+/// Items fully received so far in a streamed `[{"i":..,"t":..}, …` reply.
+pub fn partial_items(buf: &str) -> HashMap<u32, String> {
+    let (Some(a), Some(b)) = (buf.find('['), buf.rfind('}')) else {
+        return HashMap::new();
+    };
+    if a >= b {
+        return HashMap::new();
+    }
+    parse_chunk_reply(&format!("{}]", &buf[a..=b]))
+}
+
+/// Synthetic item ids for pieces of split paragraphs start here, far above
+/// any real block index.
+const PIECE_BASE: u32 = 1 << 30;
 
 #[derive(Debug, Clone, Default)]
 pub struct RunResult {
@@ -293,13 +364,17 @@ pub async fn run(
     let model = translator.model();
     let lang = cfg.target_lang.clone();
     let mut result = RunResult::default();
-    // Serve cached blocks first.
+    // Serve cached blocks first; skip blocks already in the target language.
     let mut pending: Vec<Block> = Vec::new();
     for b in seg
         .blocks
         .iter()
         .filter(|b| b.translatable && !b.source.trim().is_empty())
     {
+        if cfg.skip_same_language && lang::already_in(&b.source, &lang) {
+            result.outputs.insert(b.idx, b.source.clone());
+            continue;
+        }
         let hit = cache
             .as_ref()
             .and_then(|c| c.get(&block_hash(&b.source, &lang, &model)));
@@ -310,16 +385,48 @@ pub async fn run(
             None => pending.push(b.clone()),
         }
     }
-    let chunks = pack(&pending, cfg.chunk_budget);
+    // Overlong paragraphs become several items; `owner` maps a piece id back
+    // to its block and `pieces` lists a block's piece ids in order.
+    let mut items: Vec<Block> = Vec::new();
+    let mut owner: HashMap<u32, u32> = HashMap::new();
+    let mut pieces: HashMap<u32, Vec<u32>> = HashMap::new();
+    let mut next_piece = PIECE_BASE;
+    for b in &pending {
+        let parts = split::split_source(&b.source, cfg.chunk_budget);
+        if parts.len() == 1 {
+            items.push(b.clone());
+            continue;
+        }
+        let mut ids = Vec::new();
+        for part in parts {
+            let id = next_piece;
+            next_piece += 1;
+            owner.insert(id, b.idx);
+            ids.push(id);
+            items.push(Block {
+                idx: id,
+                source: part,
+                placeholders: HashMap::new(),
+                original: String::new(),
+                ..b.clone()
+            });
+        }
+        pieces.insert(b.idx, ids);
+    }
+    let blocks: HashMap<u32, Block> = pending.into_iter().map(|b| (b.idx, b)).collect();
+    let chunks = pack(&items, cfg.chunk_budget);
     result.chunks_total = chunks.len();
-    let by_idx: HashMap<u32, Block> = pending.into_iter().map(|b| (b.idx, b)).collect();
-    let by_idx = Arc::new(by_idx);
+    let sources: Arc<HashMap<u32, String>> =
+        Arc::new(items.into_iter().map(|b| (b.idx, b.source)).collect());
+    let owner = Arc::new(owner);
     let total = chunks.len();
     let mut stream = futures::stream::iter(chunks.into_iter().map(|chunk| {
         let translator = translator.clone();
-        let by_idx = by_idx.clone();
+        let sources = sources.clone();
+        let owner = owner.clone();
         let lang = lang.clone();
         let cancel = cancel.clone();
+        let on_event = on_event.clone();
         async move {
             if cancel.load(Ordering::Relaxed) {
                 return (
@@ -330,33 +437,70 @@ pub async fn run(
             let items: Vec<(u32, &str)> = chunk
                 .blocks
                 .iter()
-                .filter_map(|i| by_idx.get(i).map(|b| (*i, b.source.as_str())))
+                .filter_map(|i| sources.get(i).map(|t| (*i, t.as_str())))
                 .collect();
-            let reply = translator.complete(chunk_prompt(&lang, &items)).await;
+            let buf = std::sync::Mutex::new(String::new());
+            let seen = std::sync::Mutex::new(0usize);
+            let ids: Vec<u32> = chunk.blocks.clone();
+            let on_delta = |d: &str| {
+                let Some(cb) = &on_event else { return };
+                let mut b = buf.lock().unwrap_or_else(|e| e.into_inner());
+                b.push_str(d);
+                let got = partial_items(&b);
+                let mut n = seen.lock().unwrap_or_else(|e| e.into_inner());
+                if got.len() > *n {
+                    *n = got.len();
+                    for (i, t) in got.iter().filter(|(i, _)| ids.contains(i)) {
+                        let idx = owner.get(i).copied().unwrap_or(*i);
+                        cb(TranslateEvent::Preview {
+                            idx,
+                            text: t.clone(),
+                        });
+                    }
+                }
+            };
+            let reply = translator
+                .complete_stream(chunk_prompt(&lang, &items), &on_delta)
+                .await;
             (chunk, reply)
         }
     }))
     .buffer_unordered(cfg.concurrency.clamp(1, 8));
+    let mut piece_out: HashMap<u32, String> = HashMap::new();
     while let Some((chunk, reply)) = stream.next().await {
         match reply {
             Ok(text) => {
                 let parsed = parse_chunk_reply(&text);
-                for idx in &chunk.blocks {
+                let mut finished: Vec<(u32, String)> = Vec::new();
+                for id in &chunk.blocks {
                     // Only ids that belong to this chunk are accepted.
-                    if let Some(t) = parsed.get(idx) {
-                        if let (Some(block), Some(c)) = (by_idx.get(idx), cache.as_ref())
-                            && restore_block(block, t, seg.plain).is_some()
-                        {
-                            c.put(&block_hash(&block.source, &lang, &model), t);
+                    let Some(t) = parsed.get(id) else { continue };
+                    match owner.get(id) {
+                        None => finished.push((*id, t.clone())),
+                        Some(block_idx) => {
+                            piece_out.insert(*id, t.clone());
+                            let ids = &pieces[block_idx];
+                            if ids.iter().all(|p| piece_out.contains_key(p)) {
+                                let joined: String =
+                                    ids.iter().map(|p| piece_out[p].as_str()).collect();
+                                finished.push((*block_idx, joined));
+                            }
                         }
-                        if let Some(cb) = &on_event {
-                            cb(TranslateEvent::Block {
-                                idx: *idx,
-                                text: t.clone(),
-                            });
-                        }
-                        result.outputs.insert(*idx, t.clone());
                     }
+                }
+                for (idx, t) in finished {
+                    if let (Some(block), Some(c)) = (blocks.get(&idx), cache.as_ref())
+                        && restore_block(block, &t, seg.plain).is_some()
+                    {
+                        c.put(&block_hash(&block.source, &lang, &model), &t);
+                    }
+                    if let Some(cb) = &on_event {
+                        cb(TranslateEvent::Block {
+                            idx,
+                            text: t.clone(),
+                        });
+                    }
+                    result.outputs.insert(idx, t);
                 }
                 result.chunks_done += 1;
             }

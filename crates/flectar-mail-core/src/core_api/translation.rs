@@ -23,6 +23,15 @@ fn segment_body(
 }
 
 impl Core {
+    /// Translation defaults from settings (target language).
+    pub async fn translate_config(&self) -> Result<TranslateConfig> {
+        let settings = self.db.read(|conn| repo::settings::get(conn)).await?;
+        Ok(TranslateConfig {
+            target_lang: settings.translate_target_lang,
+            ..TranslateConfig::default()
+        })
+    }
+
     async fn load_translatable(&self, message_id: i64) -> Result<(translate::Segmented, String)> {
         let (html, text) = self
             .db
@@ -65,7 +74,7 @@ impl Core {
         lang: String,
     ) -> Result<Option<translate::store::StoredTranslation>> {
         let (_, hash) = self.load_translatable(message_id).await?;
-        let model = self.ai_config(Scenario::Summarize).await?.model;
+        let model = self.ai_config(Scenario::Translate).await?.model;
         self.db
             .read(move |conn| translate::store::get(conn, message_id, &lang, &model, &hash))
             .await
@@ -82,7 +91,18 @@ impl Core {
         on_event: Option<Arc<dyn Fn(TranslateEvent) + Send + Sync>>,
     ) -> Result<TranslationOutcome> {
         let (seg, source_hash) = self.load_translatable(message_id).await?;
-        let ai = self.ai_config(Scenario::Summarize).await?;
+        let estimate = translate::estimate(&seg, &cfg);
+        if cfg.skip_same_language && estimate.already_in_target {
+            return Ok(TranslationOutcome {
+                status: "same_language".into(),
+                output: String::new(),
+                is_html: !seg.plain,
+                chunks_done: 0,
+                chunks_total: 0,
+                failed_blocks: Vec::new(),
+            });
+        }
+        let ai = self.ai_config(Scenario::Translate).await?;
         let model = ai.model.clone();
         let lang = cfg.target_lang.clone();
         let hashes: Vec<String> = seg
