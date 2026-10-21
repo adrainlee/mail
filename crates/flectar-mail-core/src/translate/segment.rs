@@ -40,18 +40,10 @@ pub struct Segmented {
     pub plain: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct SegmentOpts {
     /// Translate `blockquote` content (quoted history). Off by default.
     pub translate_quotes: bool,
-}
-
-impl Default for SegmentOpts {
-    fn default() -> Self {
-        Self {
-            translate_quotes: false,
-        }
-    }
 }
 
 const BLOCK_TAGS: &[&str] = &[
