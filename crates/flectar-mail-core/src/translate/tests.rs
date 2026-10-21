@@ -22,9 +22,9 @@ impl Translator for Fake {
             .map(|it| {
                 let t = it["t"].as_str().unwrap();
                 let t = match self.mode {
-                    "drop" => t.replace("⟦t1⟧", ""),
-                    "inject" => format!("{} <script>alert(1)</script>", t.to_uppercase()),
-                    _ => t.to_uppercase(),
+                    "drop" => upper(&t.replace("⟦t1⟧", "")),
+                    "inject" => format!("{} <script>alert(1)</script>", upper(t)),
+                    _ => upper(t),
                 };
                 serde_json::json!({"i": it["i"], "t": t})
             })
@@ -41,6 +41,26 @@ impl Translator for Fake {
     fn model(&self) -> String {
         "fake".into()
     }
+}
+
+/// Upper-case text but leave placeholders (⟦t1⟧, ⟦c2⟧) untouched, like a
+/// well-behaved model.
+fn upper(t: &str) -> String {
+    let mut out = String::new();
+    let mut in_ph = false;
+    for c in t.chars() {
+        match c {
+            '⟦' => in_ph = true,
+            '⟧' => in_ph = false,
+            _ => {}
+        }
+        if in_ph || c == '⟧' {
+            out.push(c);
+        } else {
+            out.extend(c.to_uppercase());
+        }
+    }
+    out
 }
 
 fn fake(mode: &'static str) -> Arc<Fake> {
@@ -262,7 +282,7 @@ fn plain_text_signature_and_quotes() {
     let out: HashMap<u32, String> = seg
         .blocks
         .iter()
-        .map(|b| (b.idx, b.source.to_uppercase()))
+        .map(|b| (b.idx, upper(&b.source)))
         .collect();
     let r = reassemble(&seg, &out);
     assert!(r.output.contains("SEE https://x.test NOW."), "{}", r.output);
