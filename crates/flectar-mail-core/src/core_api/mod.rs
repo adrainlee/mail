@@ -17,3 +17,4 @@ mod settings;
 mod snippets;
 mod threads;
 mod threads_read;
+mod translation;
