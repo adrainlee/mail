@@ -285,6 +285,40 @@ pub struct AccountSettings {
     pub default_sender_email: Option<String>,
     #[serde(default)]
     pub sent_copy_policy: SentCopyPolicy,
+    /// Siftmail M1.5: polling cadence and optional IMAP IDLE push.
+    #[serde(default)]
+    pub sync_schedule: SyncSchedule,
+}
+
+/// Per-account polling schedule (Siftmail). Defaults favour many accounts
+/// downloading all day: hourly polling with ±20 minute jitter and no
+/// long-lived IDLE connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct SyncSchedule {
+    pub base_minutes: u32,
+    pub jitter_minutes: u32,
+    /// Keep an IMAP IDLE connection open for near-real-time mail.
+    pub idle_push: bool,
+}
+
+impl Default for SyncSchedule {
+    fn default() -> Self {
+        Self {
+            base_minutes: 60,
+            jitter_minutes: 20,
+            idle_push: false,
+        }
+    }
+}
+
+impl SyncSchedule {
+    pub fn base(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(u64::from(self.base_minutes.clamp(1, 24 * 60)) * 60)
+    }
+    pub fn jitter(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(u64::from(self.jitter_minutes.min(self.base_minutes)) * 60)
+    }
 }
 
 impl Default for AccountSettings {
@@ -295,6 +329,7 @@ impl Default for AccountSettings {
             connection: MailConnectionSettings::default(),
             default_sender_email: None,
             sent_copy_policy: SentCopyPolicy::Auto,
+            sync_schedule: SyncSchedule::default(),
         }
     }
 }

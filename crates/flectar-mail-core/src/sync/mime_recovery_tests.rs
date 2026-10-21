@@ -187,6 +187,7 @@ async fn fixture(behavior: Behavior) -> (Fixture, Option<Session>) {
         paths,
         tokens,
         credentials,
+        startup_stagger: false,
     };
     let (mut config, folder) = ctx
         .db
