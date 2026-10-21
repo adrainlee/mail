@@ -38,6 +38,8 @@ pub enum Slot {
     /// Siftmail: shared proxy password, keyed by
     /// [`crate::net::proxy::credential_key`] (never by an account id).
     ProxyPassword,
+    /// Siftmail: bearer token / API key for the embedding service (id 0).
+    EmbeddingApiKey,
 }
 
 impl Slot {
@@ -53,6 +55,7 @@ impl Slot {
             Slot::CaldavPassword => "caldav_password",
             Slot::CarddavPassword => "carddav_password",
             Slot::ProxyPassword => "proxy_password",
+            Slot::EmbeddingApiKey => "embedding_api_key",
         }
     }
 }

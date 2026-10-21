@@ -66,6 +66,21 @@ export global SiftmailBridge {
     callback set-global-proxy(int /* index into proxy-names with 0 = none */);
     callback set-account-proxy(int /* account id */, int /* mode */, int /* proxy index */);
     callback test-proxy(int /* proxy id */, string /* host */, string /* port */);
+
+    // Embedding provider
+    out property <[string]> embedding-kinds: ["Ollama", @tr("OpenAI-compatible"), @tr("Local (built-in)")];
+    in-out property <int> embedding-kind-index: 0;
+    in-out property <string> embedding-url: "";
+    in-out property <string> embedding-model: "";
+    in property <bool> embedding-has-key: false;
+    in property <string> embedding-result: "";
+    // Shown after a save changed the model/dimension and old vectors exist.
+    in-out property <bool> embedding-rebuild-prompt: false;
+    in property <string> embedding-rebuild-text: "";
+    callback refresh-embedding();
+    callback test-embedding(int /* kind */, string /* url */, string /* model */, string /* key */);
+    callback save-embedding(int /* kind */, string /* url */, string /* model */, string /* key */, bool /* key changed */);
+    callback rebuild-embedding-index();
 }
 
 component SubTab inherits Rectangle {
@@ -85,6 +100,7 @@ export component SiftmailSubTabs inherits HorizontalLayout {
     alignment: start;
     SubTab { text: @tr("Categories"); selected: SiftmailBridge.page == "categories"; clicked => { SiftmailBridge.page = "categories"; SiftmailBridge.refresh-categories(); } }
     SubTab { text: @tr("Proxies"); selected: SiftmailBridge.page == "proxies"; clicked => { SiftmailBridge.page = "proxies"; SiftmailBridge.refresh-proxies(); } }
+    SubTab { text: @tr("Embeddings"); selected: SiftmailBridge.page == "embedding"; clicked => { SiftmailBridge.page = "embedding"; SiftmailBridge.refresh-embedding(); } }
     SubTab { text: @tr("Sync scheduler"); selected: SiftmailBridge.page == "scheduler"; clicked => { SiftmailBridge.page = "scheduler"; SiftmailBridge.refresh-scheduler(); } }
 }
 
@@ -269,6 +285,60 @@ export component ProxiesPanel inherits VerticalLayout {
     }
 }
 
+export component EmbeddingPanel inherits VerticalLayout {
+    spacing: 12px;
+    Card {
+        SectionTitle { text: @tr("Embedding provider"); }
+        Text { text: @tr("Used for semantic search. Ollama can run on this PC or another machine on your LAN (e.g. http://192.168.1.20:11434); an optional bearer token is kept in the credential store. Requests bypass the system proxy."); wrap: word-wrap; color: AppTheme.secondary; font-size: TypeScale.secondary; }
+        HorizontalLayout {
+            spacing: 8px;
+            Text { text: @tr("Provider"); width: 110px; vertical-alignment: center; color: AppTheme.body; }
+            kind := ComboBox { model: SiftmailBridge.embedding-kinds; current-index <=> SiftmailBridge.embedding-kind-index; width: 220px; }
+        }
+        HorizontalLayout {
+            spacing: 8px;
+            Text { text: @tr("Base URL"); width: 110px; vertical-alignment: center; color: AppTheme.body; }
+            url := LineEdit { text <=> SiftmailBridge.embedding-url; enabled: kind.current-index != 2; placeholder-text: kind.current-index == 0 ? "http://127.0.0.1:11434" : "https://api.openai.com/v1"; horizontal-stretch: 1; input-label: @tr("Base URL"); }
+        }
+        HorizontalLayout {
+            spacing: 8px;
+            Text { text: @tr("Model"); width: 110px; vertical-alignment: center; color: AppTheme.body; }
+            model := LineEdit { text <=> SiftmailBridge.embedding-model; placeholder-text: kind.current-index == 0 ? "bge-m3" : "text-embedding-3-small"; horizontal-stretch: 1; input-label: @tr("Model"); }
+        }
+        HorizontalLayout {
+            spacing: 8px;
+            Text { text: kind.current-index == 0 ? @tr("Bearer token") : @tr("API key"); width: 110px; vertical-alignment: center; color: AppTheme.body; }
+            key := LineEdit { input-type: password; enabled: kind.current-index != 2; placeholder-text: SiftmailBridge.embedding-has-key ? "•••••• (" + @tr("saved") + ")" : @tr("Optional"); horizontal-stretch: 1; input-label: @tr("Key"); }
+        }
+        HorizontalLayout {
+            spacing: 8px;
+            alignment: start;
+            Button { text: @tr("Test connection"); enabled: kind.current-index != 2; clicked => { SiftmailBridge.test-embedding(kind.current-index, url.text, model.text, key.text); } }
+            Button { text: @tr("Save"); primary: true; clicked => { SiftmailBridge.save-embedding(kind.current-index, url.text, model.text, key.text, key.text != ""); key.text = ""; } }
+        }
+        if SiftmailBridge.embedding-result != "" : Text { text: SiftmailBridge.embedding-result; color: AppTheme.secondary; wrap: word-wrap; }
+    }
+    if SiftmailBridge.embedding-rebuild-prompt : Rectangle {
+        background: AppTheme.accent-pale;
+        border-radius: 8px;
+        border-width: 1px;
+        border-color: AppTheme.accent;
+        height: rb.preferred-height;
+        rb := VerticalLayout {
+            padding: 12px;
+            spacing: 8px;
+            SectionTitle { text: @tr("Rebuild the search index?"); }
+            Text { text: SiftmailBridge.embedding-rebuild-text; wrap: word-wrap; color: AppTheme.body; }
+            HorizontalLayout {
+                spacing: 8px;
+                alignment: start;
+                Button { text: @tr("Rebuild now"); primary: true; clicked => { SiftmailBridge.rebuild-embedding-index(); } }
+                Button { text: @tr("Later"); clicked => { SiftmailBridge.embedding-rebuild-prompt = false; } }
+            }
+        }
+    }
+}
+
 export component SiftmailPage inherits VerticalLayout {
     spacing: 12px;
     SiftmailSubTabs { }
@@ -276,4 +346,5 @@ export component SiftmailPage inherits VerticalLayout {
     if SiftmailBridge.page == "scheduler" : SchedulerPanel { }
     if SiftmailBridge.page == "categories" : CategoriesPanel { }
     if SiftmailBridge.page == "proxies" : ProxiesPanel { }
+    if SiftmailBridge.page == "embedding" : EmbeddingPanel { }
 }

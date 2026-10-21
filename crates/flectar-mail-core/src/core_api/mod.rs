@@ -9,6 +9,7 @@ mod calendar_events;
 mod categories;
 mod classify;
 mod contacts;
+pub(crate) mod embedding_settings;
 mod labels;
 mod notifications;
 mod outbox;

@@ -143,6 +143,7 @@ fn validate_folder_leaf(value: &str) -> Result<String> {
     Ok(value.to_owned())
 }
 
+pub use crate::core_api::embedding_settings::EmbeddingCheck;
 pub use crate::core_api::scheduler_status::ProviderSchedule;
 pub use crate::db::repo::notifications::{NotificationOutboxItem, RoutedTab};
 pub use crate::db::snapshot::DatabaseSnapshotManifest;
