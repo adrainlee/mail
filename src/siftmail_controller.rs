@@ -94,6 +94,333 @@ fn refresh_scheduler(ctx: &Ctx) {
     );
 }
 
+// ---- categories -------------------------------------------------------
+
+use flectar_mail_core::category::{Category, Condition, MatchField, MatchMode, MatchOp, Rule};
+
+pub(super) const RULE_FIELDS: [MatchField; 6] = [
+    MatchField::Subject,
+    MatchField::Body,
+    MatchField::FromAddress,
+    MatchField::FromDomain,
+    MatchField::FromName,
+    MatchField::To,
+];
+pub(super) const RULE_OPS: [MatchOp; 4] = [
+    MatchOp::Contains,
+    MatchOp::Equals,
+    MatchOp::Wildcard,
+    MatchOp::Regex,
+];
+
+/// Stable id for a new category: an ASCII slug of the name, or a time-based
+/// id for names without ASCII letters (e.g. Chinese).
+pub(super) fn category_id_for(name: &str, now_ms: i64) -> String {
+    let mut slug = String::new();
+    for c in name.trim().to_lowercase().chars() {
+        if c.is_ascii_alphanumeric() {
+            slug.push(c);
+        } else if !slug.ends_with('-') && !slug.is_empty() {
+            slug.push('-');
+        }
+    }
+    let slug = slug.trim_end_matches('-').chars().take(40).collect::<String>();
+    if slug.is_empty() {
+        format!("c-{now_ms}")
+    } else {
+        slug
+    }
+}
+
+/// A rule the simple editor can represent: one condition, a known field/op.
+pub(super) fn simple_rule_parts(rule: &Rule) -> Option<(usize, usize, String)> {
+    let [c] = rule.conditions.as_slice() else {
+        return None;
+    };
+    if c.negate {
+        return None;
+    }
+    let f = RULE_FIELDS.iter().position(|x| *x == c.field)?;
+    let o = RULE_OPS.iter().position(|x| *x == c.op)?;
+    Some((f, o, c.value.clone()))
+}
+
+pub(super) fn build_rule(
+    id: i64,
+    category_id: String,
+    name: String,
+    field: usize,
+    op: usize,
+    value: String,
+    enabled: bool,
+) -> Option<Rule> {
+    let value = value.trim().to_string();
+    if value.is_empty() {
+        return None;
+    }
+    Some(Rule {
+        id,
+        name: if name.trim().is_empty() {
+            value.clone()
+        } else {
+            name.trim().to_string()
+        },
+        category_id,
+        priority: 100,
+        enabled,
+        mode: MatchMode::All,
+        conditions: vec![Condition {
+            field: *RULE_FIELDS.get(field)?,
+            op: *RULE_OPS.get(op)?,
+            value,
+            case_sensitive: false,
+            negate: false,
+        }],
+        also_star: false,
+        also_mark_read: false,
+    })
+}
+
+struct CategoryData {
+    categories: Vec<Category>,
+    rules: Vec<Rule>,
+    suggestions: Vec<flectar_mail_core::suggest::CategorySuggestionRow>,
+    titles: std::collections::HashMap<i64, String>,
+}
+
+fn refresh_categories(ctx: &Ctx) {
+    ctx.spawn(
+        |core| async move {
+            let e = |e: flectar_mail_core::error::CoreError| e.to_string();
+            let categories = core.list_categories().await.map_err(e)?;
+            let rules = core.list_category_rules().await.map_err(e)?;
+            let suggestions = core.list_category_suggestions(100).await.map_err(e)?;
+            let titles = core
+                .thread_titles(suggestions.iter().map(|s| s.thread_id).collect())
+                .await
+                .map_err(e)?
+                .into_iter()
+                .collect();
+            Ok(CategoryData {
+                categories,
+                rules,
+                suggestions,
+                titles,
+            })
+        },
+        |app, d| {
+            let b = app.global::<SiftmailBridge>();
+            let index = |id: &str| {
+                d.categories
+                    .iter()
+                    .position(|c| c.id == id)
+                    .map_or(0, |i| i as i32)
+            };
+            let name = |id: &str| {
+                d.categories
+                    .iter()
+                    .find(|c| c.id == id)
+                    .map_or(id.to_string(), |c| c.name.clone())
+            };
+            let cats: Vec<CategoryItem> = d
+                .categories
+                .iter()
+                .map(|c| CategoryItem {
+                    id: c.id.clone().into(),
+                    name: c.name.clone().into(),
+                    description: c.description.clone().into(),
+                })
+                .collect();
+            let names: Vec<slint::SharedString> =
+                d.categories.iter().map(|c| c.name.clone().into()).collect();
+            let rules: Vec<RuleItem> = d
+                .rules
+                .iter()
+                .map(|r| {
+                    let simple = simple_rule_parts(r);
+                    let summary = r
+                        .conditions
+                        .iter()
+                        .map(|c| format!("{} {} \"{}\"", c.field.as_str(), c.op.as_str(), c.value))
+                        .collect::<Vec<_>>()
+                        .join(if r.mode == MatchMode::All { " AND " } else { " OR " });
+                    let (f, o, v) = simple.clone().unwrap_or((0, 0, String::new()));
+                    RuleItem {
+                        id: r.id as i32,
+                        category_index: index(&r.category_id),
+                        category_name: name(&r.category_id).into(),
+                        name: r.name.clone().into(),
+                        field_index: f as i32,
+                        op_index: o as i32,
+                        value: v.into(),
+                        summary: summary.into(),
+                        editable: simple.is_some(),
+                        enabled: r.enabled,
+                    }
+                })
+                .collect();
+            let sugg: Vec<SuggestionItem> = d
+                .suggestions
+                .iter()
+                .map(|s| SuggestionItem {
+                    id: s.id as i32,
+                    title: d
+                        .titles
+                        .get(&s.thread_id)
+                        .cloned()
+                        .unwrap_or_else(|| format!("#{}", s.thread_id))
+                        .into(),
+                    category_index: index(&s.category_id),
+                    category_name: name(&s.category_id).into(),
+                    confidence: format!("{:.0}%", s.confidence * 100.0).into(),
+                    rationale: s.rationale.clone().into(),
+                })
+                .collect();
+            b.set_categories(Rc::new(slint::VecModel::from(cats)).into());
+            b.set_category_names(Rc::new(slint::VecModel::from(names)).into());
+            b.set_rules(Rc::new(slint::VecModel::from(rules)).into());
+            b.set_suggestions(Rc::new(slint::VecModel::from(sugg)).into());
+        },
+    );
+}
+
+/// Run a core mutation, report `done` and reload the categories page.
+fn mutate_categories<F, Fut>(ctx: &Ctx, done: &'static str, work: F)
+where
+    F: FnOnce(Arc<Core>) -> Fut,
+    Fut: std::future::Future<Output = Result<(), String>> + Send + 'static,
+{
+    let again = ctx.clone();
+    ctx.spawn(work, move |app, ()| {
+        app.global::<SiftmailBridge>().set_status(done.into());
+        refresh_categories(&again);
+    });
+}
+
+fn category_id_at(ctx: &Ctx, index: i32) -> Option<String> {
+    let app = ctx.app.upgrade()?;
+    let cats = app.global::<SiftmailBridge>().get_categories();
+    slint::Model::row_data(&cats, usize::try_from(index).ok()?).map(|c| c.id.to_string())
+}
+
+fn register_categories(ctx: &Ctx, bridge: &SiftmailBridge) {
+    let c = ctx.clone();
+    bridge.on_refresh_categories(move || refresh_categories(&c));
+
+    let c = ctx.clone();
+    bridge.on_save_category(move |id, name, description| {
+        let name = name.trim().to_string();
+        if name.is_empty() {
+            return;
+        }
+        let description = description.to_string();
+        let id = id.to_string();
+        mutate_categories(&c, "Category saved.", move |core| async move {
+            let e = |e: flectar_mail_core::error::CoreError| e.to_string();
+            let existing = core.list_categories().await.map_err(e)?;
+            let category = match existing.into_iter().find(|x| x.id == id) {
+                Some(mut x) => {
+                    x.name = name;
+                    x.description = description;
+                    x
+                }
+                None => {
+                    let json = serde_json::json!({
+                        "id": category_id_for(&name, chrono::Utc::now().timestamp_millis()),
+                        "name": name,
+                        "description": description,
+                    });
+                    serde_json::from_value(json).map_err(|e| e.to_string())?
+                }
+            };
+            core.save_category(category).await.map_err(e)
+        });
+    });
+
+    let c = ctx.clone();
+    bridge.on_delete_category(move |id| {
+        let id = id.to_string();
+        mutate_categories(&c, "Category deleted.", move |core| async move {
+            core.delete_category(id).await.map(|_| ()).map_err(|e| e.to_string())
+        });
+    });
+
+    let c = ctx.clone();
+    bridge.on_save_rule(move |id, cat, name, field, op, value, enabled| {
+        let Some(category_id) = category_id_at(&c, cat) else {
+            return;
+        };
+        let Some(rule) = build_rule(
+            i64::from(id),
+            category_id,
+            name.to_string(),
+            field.max(0) as usize,
+            op.max(0) as usize,
+            value.to_string(),
+            enabled,
+        ) else {
+            return;
+        };
+        mutate_categories(&c, "Rule saved.", move |core| async move {
+            core.save_category_rule(rule)
+                .await
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        });
+    });
+
+    let c = ctx.clone();
+    bridge.on_delete_rule(move |id| {
+        mutate_categories(&c, "Rule deleted.", move |core| async move {
+            core.delete_category_rule(i64::from(id))
+                .await
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        });
+    });
+
+    let c = ctx.clone();
+    bridge.on_apply_rules_now(move || {
+        mutate_categories(&c, "Rules applied to recent mail.", |core| async move {
+            core.apply_category_rules(500)
+                .await
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        });
+    });
+
+    let c = ctx.clone();
+    bridge.on_run_ai_suggestions(move || {
+        mutate_categories(&c, "AI suggestions updated.", |core| async move {
+            core.suggest_categories(50)
+                .await
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        });
+    });
+
+    let c = ctx.clone();
+    bridge.on_accept_suggestion(move |id, cat| {
+        let chosen = category_id_at(&c, cat);
+        mutate_categories(&c, "Category applied.", move |core| async move {
+            core.accept_category_suggestion_as(i64::from(id), chosen)
+                .await
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        });
+    });
+
+    let c = ctx.clone();
+    bridge.on_reject_suggestion(move |id| {
+        mutate_categories(&c, "Suggestion rejected.", move |core| async move {
+            core.reject_suggestion(i64::from(id))
+                .await
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        });
+    });
+}
+
 pub(super) fn register(
     app: &AppWindow,
     state: &Rc<RefCell<InboxState>>,
@@ -121,6 +448,7 @@ pub(super) fn register(
             move |_, ()| refresh_scheduler(&again),
         );
     });
+    register_categories(&ctx, &bridge);
 }
 
 #[cfg(test)]
@@ -129,5 +457,21 @@ mod tests {
     fn remaining_is_rounded_up_to_minutes() {
         assert_eq!(super::format_remaining(1), "1 min");
         assert_eq!(super::format_remaining(90 * 60_000), "1 h 30 min");
+    }
+
+    #[test]
+    fn category_ids_are_valid_slugs() {
+        assert_eq!(super::category_id_for("Work & Projects", 5), "work-projects");
+        assert_eq!(super::category_id_for("发票", 5), "c-5");
+    }
+
+    #[test]
+    fn simple_rules_round_trip_through_the_editor() {
+        let r = super::build_rule(3, "work".into(), "".into(), 2, 1, " boss@x.com ".into(), true)
+            .unwrap();
+        assert_eq!(r.name, "boss@x.com");
+        assert_eq!(super::simple_rule_parts(&r), Some((2, 1, "boss@x.com".into())));
+        assert!(super::build_rule(0, "w".into(), "".into(), 0, 0, "  ".into(), true).is_none());
+        assert!(super::build_rule(0, "w".into(), "".into(), 99, 0, "x".into(), true).is_none());
     }
 }

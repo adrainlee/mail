@@ -1,10 +1,11 @@
 // Siftmail settings pages. All state and callbacks go through the
 // `SiftmailBridge` global so the Rust controller (src/siftmail_controller.rs)
 // can drive them without threading properties through the window tree.
-import { ScrollView } from "std-widgets.slint";
+import { ScrollView, ComboBox } from "std-widgets.slint";
 import { AppTheme } from "../design-system.slint";
 import { TypeScale } from "../typography.slint";
 import { Button } from "../components/button.slint";
+import { LineEdit } from "../components/controls.slint";
 
 export struct SchedulerRow {
     provider: string,
@@ -15,6 +16,10 @@ export struct SchedulerRow {
     backing-off: bool,
 }
 
+export struct CategoryItem { id: string, name: string, description: string }
+export struct RuleItem { id: int, category-index: int, category-name: string, name: string, field-index: int, op-index: int, value: string, summary: string, editable: bool, enabled: bool }
+export struct SuggestionItem { id: int, title: string, category-index: int, category-name: string, confidence: string, rationale: string }
+
 export global SiftmailBridge {
     // Sub-page inside the Siftmail settings tab.
     in-out property <string> page: "scheduler";
@@ -24,6 +29,25 @@ export global SiftmailBridge {
     in property <[SchedulerRow]> scheduler-rows: [];
     callback refresh-scheduler();
     callback reset-backoff(string);
+
+    // Categories, rules and AI suggestion review
+    in property <[CategoryItem]> categories: [];
+    in property <[string]> category-names: [];
+    in property <[RuleItem]> rules: [];
+    in property <[SuggestionItem]> suggestions: [];
+    // Display names; the controller maps indexes to subject/body/sender…
+    out property <[string]> rule-fields: [@tr("Subject"), @tr("Keyword (body)"), @tr("Sender address"), @tr("Sender domain"), @tr("Sender name"), @tr("Recipient")];
+    out property <[string]> rule-ops: [@tr("contains"), @tr("equals"), @tr("wildcard"), @tr("regex")];
+    callback refresh-categories();
+    callback save-category(string /* id, empty = new */, string /* name */, string /* description */);
+    callback delete-category(string);
+    callback save-rule(int /* id, 0 = new */, int /* category index */, string /* name */, int /* field */, int /* op */, string /* value */, bool /* enabled */);
+    callback delete-rule(int);
+    callback apply-rules-now();
+    callback run-ai-suggestions();
+    // Accept applies only the category the user picked in the row.
+    callback accept-suggestion(int /* id */, int /* chosen category index */);
+    callback reject-suggestion(int);
 }
 
 component SubTab inherits Rectangle {
@@ -41,6 +65,7 @@ component SubTab inherits Rectangle {
 export component SiftmailSubTabs inherits HorizontalLayout {
     spacing: 6px;
     alignment: start;
+    SubTab { text: @tr("Categories"); selected: SiftmailBridge.page == "categories"; clicked => { SiftmailBridge.page = "categories"; SiftmailBridge.refresh-categories(); } }
     SubTab { text: @tr("Sync scheduler"); selected: SiftmailBridge.page == "scheduler"; clicked => { SiftmailBridge.page = "scheduler"; SiftmailBridge.refresh-scheduler(); } }
 }
 
@@ -85,9 +110,94 @@ export component SchedulerPanel inherits VerticalLayout {
     }
 }
 
+component Card inherits Rectangle {
+    background: AppTheme.surface;
+    border-radius: 8px;
+    border-width: 1px;
+    border-color: AppTheme.border-subtle;
+    height: max(40px, inner.preferred-height);
+    inner := VerticalLayout { padding: 12px; spacing: 8px; @children }
+}
+
+component SectionTitle inherits Text { color: AppTheme.heading; font-weight: 600; font-size: TypeScale.body; }
+
+export component CategoriesPanel inherits VerticalLayout {
+    spacing: 12px;
+    // --- categories ---
+    Card {
+        SectionTitle { text: @tr("Categories"); }
+        for c in SiftmailBridge.categories : HorizontalLayout {
+            spacing: 8px;
+            cname := LineEdit { text: c.name; horizontal-stretch: 1; input-label: @tr("Name"); }
+            cdesc := LineEdit { text: c.description; horizontal-stretch: 2; placeholder-text: @tr("Description (helps AI suggestions)"); input-label: @tr("Description"); }
+            Button { text: @tr("Save"); clicked => { SiftmailBridge.save-category(c.id, cname.text, cdesc.text); } }
+            Button { text: @tr("Delete"); destructive: true; clicked => { SiftmailBridge.delete-category(c.id); } }
+        }
+        HorizontalLayout {
+            spacing: 8px;
+            new-name := LineEdit { placeholder-text: @tr("New category name"); horizontal-stretch: 1; input-label: @tr("Name"); }
+            new-desc := LineEdit { placeholder-text: @tr("Description"); horizontal-stretch: 2; input-label: @tr("Description"); }
+            Button { text: @tr("Add"); primary: true; enabled: new-name.text != ""; clicked => { SiftmailBridge.save-category("", new-name.text, new-desc.text); new-name.text = ""; new-desc.text = ""; } }
+        }
+    }
+    // --- rules ---
+    Card {
+        SectionTitle { text: @tr("Rules"); }
+        Text { text: @tr("Rules run before AI and only assign a category. Match by subject, keyword or sender."); wrap: word-wrap; color: AppTheme.secondary; font-size: TypeScale.secondary; }
+        for r in SiftmailBridge.rules : HorizontalLayout {
+            spacing: 6px;
+            if !r.editable : Text { text: r.name + " → " + r.category-name + " · " + r.summary; color: AppTheme.body; horizontal-stretch: 1; vertical-alignment: center; wrap: word-wrap; }
+            if r.editable : HorizontalLayout {
+                horizontal-stretch: 1;
+                spacing: 6px;
+                rname := LineEdit { text: r.name; width: 120px; input-label: @tr("Rule name"); }
+                rfield := ComboBox { model: SiftmailBridge.rule-fields; current-index: r.field-index; width: 140px; }
+                rop := ComboBox { model: SiftmailBridge.rule-ops; current-index: r.op-index; width: 110px; }
+                rval := LineEdit { text: r.value; horizontal-stretch: 1; input-label: @tr("Value"); }
+                rcat := ComboBox { model: SiftmailBridge.category-names; current-index: r.category-index; width: 130px; }
+                Button { text: @tr("Save"); clicked => { SiftmailBridge.save-rule(r.id, rcat.current-index, rname.text, rfield.current-index, rop.current-index, rval.text, r.enabled); } }
+            }
+            Button { text: r.enabled ? @tr("Disable") : @tr("Enable"); enabled: r.editable; clicked => { SiftmailBridge.save-rule(r.id, r.category-index, r.name, r.field-index, r.op-index, r.value, !r.enabled); } }
+            Button { text: @tr("Delete"); destructive: true; clicked => { SiftmailBridge.delete-rule(r.id); } }
+        }
+        HorizontalLayout {
+            spacing: 6px;
+            nname := LineEdit { placeholder-text: @tr("Rule name"); width: 120px; input-label: @tr("Rule name"); }
+            nfield := ComboBox { model: SiftmailBridge.rule-fields; current-index: 0; width: 140px; }
+            nop := ComboBox { model: SiftmailBridge.rule-ops; current-index: 0; width: 110px; }
+            nval := LineEdit { placeholder-text: @tr("Text to match"); horizontal-stretch: 1; input-label: @tr("Value"); }
+            ncat := ComboBox { model: SiftmailBridge.category-names; current-index: 0; width: 130px; }
+            Button { text: @tr("Add rule"); primary: true; enabled: nval.text != "" && SiftmailBridge.category-names.length > 0; clicked => { SiftmailBridge.save-rule(0, ncat.current-index, nname.text, nfield.current-index, nop.current-index, nval.text, true); nval.text = ""; nname.text = ""; } }
+        }
+        HorizontalLayout { alignment: start; Button { text: @tr("Apply rules to recent mail"); clicked => { SiftmailBridge.apply-rules-now(); } } }
+    }
+    // --- AI suggestion review ---
+    Card {
+        SectionTitle { text: @tr("AI suggestions to review"); }
+        Text { text: @tr("The AI only suggests. Nothing changes until you accept, and accepting only applies the category you pick here."); wrap: word-wrap; color: AppTheme.secondary; font-size: TypeScale.secondary; }
+        HorizontalLayout { alignment: start; spacing: 8px;
+            Button { text: @tr("Ask AI for suggestions"); clicked => { SiftmailBridge.run-ai-suggestions(); } }
+            Button { text: @tr("Refresh"); clicked => { SiftmailBridge.refresh-categories(); } }
+        }
+        if SiftmailBridge.suggestions.length == 0 : Text { text: @tr("No pending suggestions."); color: AppTheme.muted; }
+        for sg in SiftmailBridge.suggestions : HorizontalLayout {
+            spacing: 8px;
+            VerticalLayout {
+                horizontal-stretch: 1;
+                Text { text: sg.title; color: AppTheme.heading; overflow: elide; }
+                Text { text: sg.category-name + " · " + sg.confidence + (sg.rationale != "" ? " · " + sg.rationale : ""); color: AppTheme.secondary; font-size: TypeScale.secondary; wrap: word-wrap; }
+            }
+            scat := ComboBox { model: SiftmailBridge.category-names; current-index: sg.category-index; width: 140px; }
+            Button { text: @tr("Accept"); primary: true; clicked => { SiftmailBridge.accept-suggestion(sg.id, scat.current-index); } }
+            Button { text: @tr("Reject"); clicked => { SiftmailBridge.reject-suggestion(sg.id); } }
+        }
+    }
+}
+
 export component SiftmailPage inherits VerticalLayout {
     spacing: 12px;
     SiftmailSubTabs { }
     if SiftmailBridge.status != "" : Text { text: SiftmailBridge.status; color: AppTheme.secondary; wrap: word-wrap; }
     if SiftmailBridge.page == "scheduler" : SchedulerPanel { }
+    if SiftmailBridge.page == "categories" : CategoriesPanel { }
 }
