@@ -1,0 +1,93 @@
+// Siftmail settings pages. All state and callbacks go through the
+// `SiftmailBridge` global so the Rust controller (src/siftmail_controller.rs)
+// can drive them without threading properties through the window tree.
+import { ScrollView } from "std-widgets.slint";
+import { AppTheme } from "../design-system.slint";
+import { TypeScale } from "../typography.slint";
+import { Button } from "../components/button.slint";
+
+export struct SchedulerRow {
+    provider: string,
+    accounts: string,
+    level: int,
+    remaining: string,
+    last-error: string,
+    backing-off: bool,
+}
+
+export global SiftmailBridge {
+    // Sub-page inside the Siftmail settings tab.
+    in-out property <string> page: "scheduler";
+    in-out property <string> status: "";
+
+    // Scheduler status
+    in property <[SchedulerRow]> scheduler-rows: [];
+    callback refresh-scheduler();
+    callback reset-backoff(string);
+}
+
+component SubTab inherits Rectangle {
+    in property <string> text;
+    in property <bool> selected;
+    callback clicked;
+    height: 30px;
+    width: label.preferred-width + 24px;
+    border-radius: 6px;
+    background: root.selected ? AppTheme.accent-soft : touch.has-hover ? AppTheme.selected-row : transparent;
+    label := Text { text: root.text; color: root.selected ? AppTheme.accent : AppTheme.body; font-size: TypeScale.secondary; vertical-alignment: center; horizontal-alignment: center; }
+    touch := TouchArea { clicked => { root.clicked(); } }
+}
+
+export component SiftmailSubTabs inherits HorizontalLayout {
+    spacing: 6px;
+    alignment: start;
+    SubTab { text: @tr("Sync scheduler"); selected: SiftmailBridge.page == "scheduler"; clicked => { SiftmailBridge.page = "scheduler"; SiftmailBridge.refresh-scheduler(); } }
+}
+
+export component SchedulerPanel inherits VerticalLayout {
+    spacing: 8px;
+    Text { text: @tr("Accounts on one provider share a backoff: after a throttle or ban-like error the provider waits 1 h, doubling up to 24 h (±20%). Each provider allows 2 concurrent polling connections."); wrap: word-wrap; color: AppTheme.secondary; font-size: TypeScale.secondary; }
+    HorizontalLayout {
+        alignment: start;
+        spacing: 8px;
+        Button { text: @tr("Refresh"); clicked => { SiftmailBridge.refresh-scheduler(); } }
+    }
+    if SiftmailBridge.scheduler-rows.length == 0 : Text { text: @tr("No accounts yet."); color: AppTheme.muted; }
+    for row in SiftmailBridge.scheduler-rows : Rectangle {
+        height: max(56px, content.preferred-height + 16px);
+        background: AppTheme.surface;
+        border-radius: 8px;
+        border-width: 1px;
+        border-color: row.backing-off ? #d1242f : AppTheme.border-subtle;
+        content := HorizontalLayout {
+            padding: 10px;
+            spacing: 12px;
+            VerticalLayout {
+                horizontal-stretch: 1;
+                spacing: 2px;
+                Text { text: row.provider; color: AppTheme.heading; font-weight: 600; }
+                Text { text: row.accounts; color: AppTheme.secondary; font-size: TypeScale.secondary; wrap: word-wrap; }
+                if row.last-error != "" : Text { text: row.last-error; color: AppTheme.muted; font-size: TypeScale.secondary; wrap: word-wrap; }
+            }
+            VerticalLayout {
+                alignment: center;
+                Text {
+                    text: row.backing-off ? @tr("Backing off (level {}) · {}", row.level, row.remaining) : @tr("OK");
+                    color: row.backing-off ? #d1242f : #1a7f37;
+                    horizontal-alignment: right;
+                }
+            }
+            if row.backing-off : VerticalLayout {
+                alignment: center;
+                Button { text: @tr("Reset"); clicked => { SiftmailBridge.reset-backoff(row.provider); } }
+            }
+        }
+    }
+}
+
+export component SiftmailPage inherits VerticalLayout {
+    spacing: 12px;
+    SiftmailSubTabs { }
+    if SiftmailBridge.status != "" : Text { text: SiftmailBridge.status; color: AppTheme.secondary; wrap: word-wrap; }
+    if SiftmailBridge.page == "scheduler" : SchedulerPanel { }
+}
