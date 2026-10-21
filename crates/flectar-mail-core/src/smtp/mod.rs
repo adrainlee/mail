@@ -216,11 +216,15 @@ async fn imported_certificate_connection(
     use crate::models::ConnectionSecurity;
 
     let connect = async {
-        let mut tcp = TcpStream::connect((&*cfg.smtp_host, cfg.smtp_port))
-            .await
-            .map_err(|error| {
-                CoreError::Smtp(format!("{}:{}: {error}", cfg.smtp_host, cfg.smtp_port))
-            })?;
+        let mut tcp = crate::net::proxy::connect_tcp(
+            &cfg.smtp_host,
+            cfg.smtp_port,
+            cfg.settings.connection.proxy.as_ref(),
+        )
+        .await
+        .map_err(|error| {
+            CoreError::Smtp(format!("{}:{}: {error}", cfg.smtp_host, cfg.smtp_port))
+        })?;
         tcp.set_nodelay(true).ok();
 
         let starttls = match cfg.settings.connection.smtp_security {

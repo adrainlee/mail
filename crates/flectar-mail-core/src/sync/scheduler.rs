@@ -84,6 +84,9 @@ const THROTTLE_MARKERS: &[&str] = &[
 pub fn classify_failure(err: &CoreError) -> FailureKind {
     match err {
         CoreError::Auth(_) | CoreError::NeedsReauth => FailureKind::AccountAuth,
+        // A broken proxy only affects the accounts using it, never the
+        // whole mail provider.
+        e if crate::net::proxy::is_proxy_error(e) => FailureKind::Transient,
         _ => {
             let text = err.to_string().to_ascii_lowercase();
             if THROTTLE_MARKERS.iter().any(|m| text.contains(m)) {
@@ -283,6 +286,16 @@ mod tests {
         );
         assert_eq!(
             classify_failure(&CoreError::Network("dns failure".into())),
+            FailureKind::Transient
+        );
+    }
+
+    #[test]
+    fn proxy_failures_do_not_back_off_the_provider() {
+        assert_eq!(
+            classify_failure(&CoreError::Network(
+                "proxy unreachable: 10.0.0.1:1080: Connection refused".into()
+            )),
             FailureKind::Transient
         );
     }

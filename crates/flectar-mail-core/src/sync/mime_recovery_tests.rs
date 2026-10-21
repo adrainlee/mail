@@ -224,6 +224,7 @@ async fn fixture(behavior: Behavior) -> (Fixture, Option<Session>) {
         imap_security: ConnectionSecurity::Tls,
         smtp_security: ConnectionSecurity::Tls,
         trusted_certificate_pem: CERT.into(),
+        ..Default::default()
     };
     credentials::store_async(
         ctx.credentials.clone(),

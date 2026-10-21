@@ -6547,6 +6547,7 @@ pub fn run(platform: PlatformContext) -> Result<(), Box<dyn std::error::Error>> 
                     )
                     .unwrap_or_default(),
                     trusted_certificate_pem: app.get_trusted_certificate_pem().to_string(),
+                    ..Default::default()
                 },
             };
             app.set_account_setup_in_progress(true);

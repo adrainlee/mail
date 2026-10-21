@@ -18,6 +18,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("migrations/013_ai_suggestions.sql"),
     include_str!("migrations/014_provider_backoff.sql"),
     include_str!("migrations/015_categories.sql"),
+    include_str!("migrations/016_proxies.sql"),
 ];
 pub const LATEST_VERSION: i64 = MIGRATIONS.len() as i64;
 
@@ -141,6 +142,7 @@ mod tests {
             "notification_outbox",
             "pending_actions",
             "provider_backoff",
+            "proxies",
             "route_cache",
             "rule_conditions",
             "sender_identities",

@@ -29,7 +29,7 @@ fn acceptor_for(cert: &str) -> tokio_rustls::TlsAcceptor {
     tokio_rustls::TlsAcceptor::from(Arc::new(config))
 }
 fn settings(mode: ConnectionSecurity) -> MailConnectionSettings {
-    settings_with_certificate(mode, CERT)
+    settings_with_certificate(mode, CERT)..Default::default()
 }
 
 fn settings_with_certificate(
@@ -40,7 +40,8 @@ fn settings_with_certificate(
         imap_security: mode,
         smtp_security: mode,
         trusted_certificate_pem: certificate.into(),
-    }
+        ..Default::default()
+    }..Default::default()
 }
 async fn line<S: tokio::io::AsyncRead + Unpin>(stream: &mut BufReader<S>) -> String {
     let mut line = String::new();
