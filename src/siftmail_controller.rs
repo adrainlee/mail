@@ -421,6 +421,207 @@ fn register_categories(ctx: &Ctx, bridge: &SiftmailBridge) {
     });
 }
 
+// ---- proxies ----------------------------------------------------------
+
+use flectar_mail_core::net::proxy::{ProxyConfig, ProxyKind, ProxyMode};
+
+pub(super) fn mode_index(mode: ProxyMode) -> i32 {
+    match mode {
+        ProxyMode::Direct => 0,
+        ProxyMode::Global => 1,
+        ProxyMode::Custom => 2,
+    }
+}
+
+pub(super) fn mode_at(index: i32) -> ProxyMode {
+    match index {
+        0 => ProxyMode::Direct,
+        2 => ProxyMode::Custom,
+        _ => ProxyMode::Global,
+    }
+}
+
+struct ProxyData {
+    proxies: Vec<(ProxyConfig, bool)>,
+    global: Option<i64>,
+    accounts: Vec<flectar_mail_core::models::AccountConfig>,
+}
+
+fn refresh_proxies(ctx: &Ctx) {
+    ctx.spawn(
+        |core| async move {
+            let e = |e: flectar_mail_core::error::CoreError| e.to_string();
+            Ok(ProxyData {
+                proxies: core.list_proxies().await.map_err(e)?,
+                global: core.global_proxy_id().await.map_err(e)?,
+                accounts: core.list_account_configs().await.map_err(e)?,
+            })
+        },
+        |app, d| {
+            let b = app.global::<SiftmailBridge>();
+            // proxy-names: index 0 = none, n = proxies[n - 1].
+            let pos = |id: Option<i64>| {
+                id.and_then(|id| d.proxies.iter().position(|(p, _)| p.id == id))
+                    .map_or(0, |i| i as i32 + 1)
+            };
+            let mut names: Vec<slint::SharedString> = vec!["—".into()];
+            names.extend(d.proxies.iter().map(|(p, _)| {
+                let label = if p.name.is_empty() {
+                    format!("{}:{}", p.host, p.port)
+                } else {
+                    p.name.clone()
+                };
+                slint::SharedString::from(label)
+            }));
+            let items: Vec<ProxyItem> = d
+                .proxies
+                .iter()
+                .map(|(p, has)| ProxyItem {
+                    id: p.id as i32,
+                    name: p.name.clone().into(),
+                    kind_index: i32::from(p.kind == ProxyKind::HttpConnect),
+                    host: p.host.clone().into(),
+                    port: p.port.to_string().into(),
+                    username: p.username.clone().into(),
+                    has_password: *has,
+                })
+                .collect();
+            let accounts: Vec<AccountProxyItem> = d
+                .accounts
+                .iter()
+                .map(|a| AccountProxyItem {
+                    account_id: a.id as i32,
+                    email: a.email.clone().into(),
+                    mode_index: mode_index(flectar_mail_core::net::proxy::effective_mode(
+                        &a.settings.connection,
+                    )),
+                    proxy_index: pos(a.settings.connection.proxy_id),
+                })
+                .collect();
+            b.set_proxies(Rc::new(slint::VecModel::from(items)).into());
+            b.set_proxy_names(Rc::new(slint::VecModel::from(names)).into());
+            b.set_global_proxy_index(pos(d.global));
+            b.set_account_proxies(Rc::new(slint::VecModel::from(accounts)).into());
+        },
+    );
+}
+
+/// Proxy id for a `proxy-names` index (0 = none).
+fn proxy_id_at(ctx: &Ctx, index: i32) -> Option<i64> {
+    let app = ctx.app.upgrade()?;
+    let list = app.global::<SiftmailBridge>().get_proxies();
+    let i = usize::try_from(index).ok()?.checked_sub(1)?;
+    slint::Model::row_data(&list, i).map(|p| i64::from(p.id))
+}
+
+fn mutate_proxies<F, Fut>(ctx: &Ctx, done: &'static str, work: F)
+where
+    F: FnOnce(Arc<Core>) -> Fut,
+    Fut: std::future::Future<Output = Result<(), String>> + Send + 'static,
+{
+    let again = ctx.clone();
+    ctx.spawn(work, move |app, ()| {
+        app.global::<SiftmailBridge>().set_status(done.into());
+        refresh_proxies(&again);
+    });
+}
+
+fn register_proxies(ctx: &Ctx, bridge: &SiftmailBridge) {
+    let c = ctx.clone();
+    bridge.on_refresh_proxies(move || refresh_proxies(&c));
+
+    let c = ctx.clone();
+    bridge.on_save_proxy(
+        move |id, name, kind, host, port, username, password, changed| {
+            let Ok(port) = port.trim().parse::<u16>() else {
+                if let Some(app) = c.app.upgrade() {
+                    app.global::<SiftmailBridge>()
+                        .set_status("Port must be a number between 1 and 65535.".into());
+                }
+                return;
+            };
+            let cfg = ProxyConfig {
+                id: i64::from(id),
+                name: name.trim().to_string(),
+                kind: if kind == 1 {
+                    ProxyKind::HttpConnect
+                } else {
+                    ProxyKind::Socks5
+                },
+                host: host.trim().to_string(),
+                port,
+                username: username.trim().to_string(),
+                password: None,
+                remote_dns: true,
+            };
+            let password = changed.then(|| password.to_string());
+            mutate_proxies(&c, "Proxy saved.", move |core| async move {
+                core.save_proxy(cfg, password)
+                    .await
+                    .map(|_| ())
+                    .map_err(|e| e.to_string())
+            });
+        },
+    );
+
+    let c = ctx.clone();
+    bridge.on_delete_proxy(move |id| {
+        mutate_proxies(&c, "Proxy deleted.", move |core| async move {
+            core.delete_proxy(i64::from(id))
+                .await
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        });
+    });
+
+    let c = ctx.clone();
+    bridge.on_set_global_proxy(move |index| {
+        let id = proxy_id_at(&c, index);
+        mutate_proxies(&c, "Global proxy updated.", move |core| async move {
+            core.set_global_proxy_id(id).await.map_err(|e| e.to_string())
+        });
+    });
+
+    let c = ctx.clone();
+    bridge.on_set_account_proxy(move |account_id, mode, index| {
+        let mode = mode_at(mode);
+        let id = proxy_id_at(&c, index);
+        if mode == ProxyMode::Custom && id.is_none() {
+            return;
+        }
+        mutate_proxies(&c, "Account proxy updated.", move |core| async move {
+            core.set_account_proxy(i64::from(account_id), mode, id)
+                .await
+                .map_err(|e| e.to_string())
+        });
+    });
+
+    let c = ctx.clone();
+    bridge.on_test_proxy(move |id, host, port| {
+        let host = host.to_string();
+        let port = port.trim().parse::<u16>().unwrap_or(993);
+        let target = format!("{host}:{port}");
+        if let Some(app) = c.app.upgrade() {
+            app.global::<SiftmailBridge>()
+                .set_proxy_test_result(format!("Testing via proxy → {target}…").into());
+        }
+        let weak = c.app.clone();
+        let Some(core) = c.core() else { return };
+        let task = c.runtime.spawn(async move { core.test_proxy(i64::from(id), host, port).await });
+        let _ = slint::spawn_local(async move {
+            let text = match task.await {
+                Ok(Ok(ms)) => format!("OK: reached {target} through the proxy in {ms} ms."),
+                Ok(Err(e)) => format!("Failed: {e}"),
+                Err(e) => format!("Failed: {e}"),
+            };
+            if let Some(app) = weak.upgrade() {
+                app.global::<SiftmailBridge>()
+                    .set_proxy_test_result(text.into());
+            }
+        });
+    });
+}
+
 pub(super) fn register(
     app: &AppWindow,
     state: &Rc<RefCell<InboxState>>,
@@ -449,6 +650,7 @@ pub(super) fn register(
         );
     });
     register_categories(&ctx, &bridge);
+    register_proxies(&ctx, &bridge);
 }
 
 #[cfg(test)]
@@ -457,6 +659,15 @@ mod tests {
     fn remaining_is_rounded_up_to_minutes() {
         assert_eq!(super::format_remaining(1), "1 min");
         assert_eq!(super::format_remaining(90 * 60_000), "1 h 30 min");
+    }
+
+    #[test]
+    fn proxy_modes_map_both_ways() {
+        use flectar_mail_core::net::proxy::ProxyMode;
+        for m in [ProxyMode::Direct, ProxyMode::Global, ProxyMode::Custom] {
+            assert_eq!(super::mode_at(super::mode_index(m)), m);
+        }
+        assert_eq!(super::mode_at(7), ProxyMode::Global);
     }
 
     #[test]
