@@ -667,6 +667,29 @@ pub fn validate_automation_plan(
     plan
 }
 
+/// Turn a model decision into non-executable suggestions. Only ids of enabled,
+/// configured rules survive; the rules' configured actions are deliberately
+/// not carried over, so AI output can never be executed.
+pub fn suggestions_from_decision(
+    thread_id: i64,
+    decision: &AiRoutingDecision,
+    rules: &[AiAutomationRule],
+    model: &str,
+) -> Vec<crate::suggest::Suggestion> {
+    let selected: std::collections::HashSet<&str> =
+        decision.rule_ids.iter().map(String::as_str).collect();
+    rules
+        .iter()
+        .filter(|rule| rule.enabled && selected.contains(rule.id.as_str()))
+        .map(|rule| crate::suggest::Suggestion {
+            thread_id,
+            rule_id: rule.id.clone(),
+            rule_name: rule.name.clone(),
+            model: model.to_string(),
+        })
+        .collect()
+}
+
 /// Parse a compound decision. Markdown fences and surrounding chatter are
 /// tolerated, but malformed output selects no automation (safe failure).
 pub fn parse_automation_decision(out: &str) -> AiRoutingDecision {
@@ -1386,5 +1409,27 @@ mod tests {
             automation_planner_prompt("Invoices should get the Finance label", &labels, &[]);
         assert!(prompt[0].content.contains("id: 7, name: Finance"));
         assert_eq!(prompt[1].content, "Invoices should get the Finance label");
+    }
+
+    #[test]
+    fn malicious_decision_only_yields_suggestions_for_known_rules() {
+        let rules = vec![crate::models::AiAutomationRule {
+            id: "invoice".into(),
+            name: "Invoices".into(),
+            source_prompt: String::new(),
+            instruction: "vendor invoice".into(),
+            enabled: true,
+            actions: vec![crate::models::AiAutomationAction {
+                kind: "trash".into(),
+                value: String::new(),
+            }],
+        }];
+        let decision = parse_automation_decision(
+            r#"{"category":"None","automations":["invoice","archive","trash"],"actions":[{"kind":"trash"}]}"#,
+        );
+        let out = suggestions_from_decision(9, &decision, &rules, "m");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].rule_id, "invoice");
+        assert_eq!(out[0].thread_id, 9);
     }
 }

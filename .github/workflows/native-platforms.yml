@@ -6,7 +6,7 @@ on:
       include_linux:
         description: Build Linux packages
         type: boolean
-        default: true
+        default: false
       include_windows:
         description: Build Windows packages
         type: boolean
@@ -14,7 +14,7 @@ on:
       include_macos:
         description: Build macOS packages
         type: boolean
-        default: true
+        default: false
       run_quality:
         description: Run the full quality suite (disable only for manual packaging checks)
         type: boolean
@@ -22,7 +22,7 @@ on:
       include_android:
         description: Build the signed Android APK
         type: boolean
-        default: true
+        default: false
       include_ios:
         description: Also build an experimental unsigned iOS archive
         type: boolean
@@ -93,7 +93,10 @@ jobs:
 
   linux:
     needs: metadata
-    if: github.event_name == 'push' || github.event_name == 'pull_request' || inputs.include_linux
+    # Siftmail is Windows-only; non-Windows jobs are gated off (not deleted)
+    # to keep upstream merges simple. The multi-platform release job is
+    # disabled until a Windows-only release pipeline exists.
+    if: false && (github.event_name == 'push' || github.event_name == 'pull_request' || inputs.include_linux)
     name: Linux packages (x64)
     runs-on: ubuntu-22.04
     env:
@@ -179,7 +182,10 @@ jobs:
 
   rpm:
     needs: metadata
-    if: github.event_name == 'push' || github.event_name == 'pull_request' || inputs.include_linux
+    # Siftmail is Windows-only; non-Windows jobs are gated off (not deleted)
+    # to keep upstream merges simple. The multi-platform release job is
+    # disabled until a Windows-only release pipeline exists.
+    if: false && (github.event_name == 'push' || github.event_name == 'pull_request' || inputs.include_linux)
     name: Fedora RPM build (x64, Fedora 43 baseline)
     runs-on: ubuntu-24.04
     # Build against the oldest supported Fedora; test this exact artifact below.
@@ -274,7 +280,10 @@ jobs:
 
   flatpak:
     needs: metadata
-    if: github.event_name == 'push' || github.event_name == 'pull_request' || inputs.include_linux
+    # Siftmail is Windows-only; non-Windows jobs are gated off (not deleted)
+    # to keep upstream merges simple. The multi-platform release job is
+    # disabled until a Windows-only release pipeline exists.
+    if: false && (github.event_name == 'push' || github.event_name == 'pull_request' || inputs.include_linux)
     name: Flatpak preview bundle (x64)
     runs-on: ubuntu-24.04
     env:
@@ -428,7 +437,10 @@ jobs:
 
   macos:
     needs: metadata
-    if: github.event_name == 'push' || inputs.include_macos
+    # Siftmail is Windows-only; non-Windows jobs are gated off (not deleted)
+    # to keep upstream merges simple. The multi-platform release job is
+    # disabled until a Windows-only release pipeline exists.
+    if: false && (github.event_name == 'push' || inputs.include_macos)
     name: macOS application (${{ matrix.name }})
     strategy:
       fail-fast: false
@@ -486,7 +498,11 @@ jobs:
 
   android:
     needs: metadata
+    # Siftmail is Windows-only; non-Windows jobs are gated off (not deleted)
+    # to keep upstream merges simple. The multi-platform release job is
+    # disabled until a Windows-only release pipeline exists.
     if: >-
+      false &&
       github.event_name == 'push' ||
       (github.event_name == 'workflow_dispatch' && inputs.include_android)
     name: Android signed APK (arm64)
@@ -593,7 +609,10 @@ jobs:
 
   ios:
     needs: metadata
-    if: github.event_name == 'workflow_dispatch' && inputs.include_ios
+    # Siftmail is Windows-only; non-Windows jobs are gated off (not deleted)
+    # to keep upstream merges simple. The multi-platform release job is
+    # disabled until a Windows-only release pipeline exists.
+    if: false && (github.event_name == 'workflow_dispatch' && inputs.include_ios)
     name: iOS unsigned archive (arm64)
     runs-on: macos-15
     steps:
@@ -643,7 +662,11 @@ jobs:
   release:
     name: Publish GitHub Release
     # Every published channel must include an APK with the shared identity.
+    # Siftmail is Windows-only; non-Windows jobs are gated off (not deleted)
+    # to keep upstream merges simple. The multi-platform release job is
+    # disabled until a Windows-only release pipeline exists.
     if: >-
+      false &&
       !cancelled() && github.event_name == 'push' && github.ref_type == 'tag' &&
       needs.metadata.result == 'success' && needs.quality.result == 'success' &&
       needs.linux.result == 'success' && needs.rpm.result == 'success' &&
