@@ -320,6 +320,12 @@ pub fn delete(conn: &Connection, id: i64) -> Result<bool> {
     Ok(conn.execute("DELETE FROM proxies WHERE id = ?1", params![id])? > 0)
 }
 
+/// Whether an error came from the proxy itself (unreachable/auth/handshake),
+/// so the scheduler can back off only accounts using that proxy.
+pub fn is_proxy_error(err: &CoreError) -> bool {
+    matches!(err, CoreError::Network(m) if m.starts_with("proxy "))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -591,10 +597,4 @@ mod tests {
         assert!(save(&conn, &cfg(ProxyKind::HttpConnect, 0)).is_err());
         assert!(delete(&conn, id).unwrap());
     }
-}
-
-/// Whether an error came from the proxy itself (unreachable/auth/handshake),
-/// so the scheduler can back off only accounts using that proxy.
-pub fn is_proxy_error(err: &CoreError) -> bool {
-    matches!(err, CoreError::Network(m) if m.starts_with("proxy "))
 }
