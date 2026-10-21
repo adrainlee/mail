@@ -5,6 +5,7 @@
 //! History API, reads hydrate complete Gmail threads, mutations use native
 //! labels, and drafts/sending use the Gmail API. The existing SQLite cache and
 //! pending-action queue remain provider-neutral and fully offline-first.
+use crate::sync::scheduler;
 
 use super::engine::{
     PriorityFetchCmd, SyncCmd, SyncCtx, configured_sync_interval, emit_sync_status, set_state,
@@ -3671,6 +3672,18 @@ async fn run_actor(
     let mut waiters = Vec::<oneshot::Sender<std::result::Result<(), String>>>::new();
     let mut refresh_labels = true;
     let mut backoff = 1u64;
+    // Siftmail M1.5 scheduling, shared with IMAP/JMAP (sync/scheduler.rs).
+    let provider = scheduler::account_provider_key(&config);
+    if ctx.startup_stagger {
+        let delay = scheduler::startup_delay(&mut rand::rng());
+        match tokio::time::timeout(delay, rx.recv()).await {
+            Ok(None) | Ok(Some(SyncCmd::Shutdown)) => return,
+            Ok(Some(SyncCmd::SyncNow {
+                complete: Some(done),
+            })) => waiters.push(done),
+            _ => {}
+        }
+    }
 
     loop {
         while let Ok(command) = rx.try_recv() {
@@ -3686,6 +3699,26 @@ async fn run_actor(
             }
         }
 
+        if let Some((wait, state)) = scheduler::backoff_remaining(&ctx.db, &provider).await {
+            let message = format!(
+                "provider {provider} backing off (level {}): {}",
+                state.level, state.last_error
+            );
+            set_state_error(&ctx, account_id, "offline", &message).await;
+            match tokio::time::timeout(wait, rx.recv()).await {
+                Ok(None) | Ok(Some(SyncCmd::Shutdown)) => return,
+                Ok(Some(SyncCmd::SyncNow {
+                    complete: Some(complete),
+                })) => waiters.push(complete),
+                _ => {}
+            }
+        }
+        let schedule = settings_rx.borrow().sync_schedule;
+        let permit = if schedule.idle_push {
+            None
+        } else {
+            Some(scheduler::acquire_provider_permit(&provider).await)
+        };
         set_state(&ctx, account_id, "syncing").await;
         let mail_history = settings_rx.borrow_and_update().mail_history;
         let result = async {
@@ -3702,6 +3735,9 @@ async fn run_actor(
         }
         .await;
         refresh_labels = false;
+        drop(permit);
+        let throttled =
+            scheduler::record_cycle(&ctx.db, &provider, result.as_ref().map(|_| ())).await;
 
         let (delay, rerun) = match result {
             Ok((actions_remaining, backfill_done)) => {
@@ -3730,7 +3766,11 @@ async fn run_actor(
                     let _ = waiter.send(Ok(()));
                 }
                 let delay = if backfill_done {
-                    configured_sync_interval(&ctx.db).await
+                    scheduler::next_cycle_delay(
+                        &schedule,
+                        configured_sync_interval(&ctx.db).await,
+                        &mut rand::rng(),
+                    )
                 } else {
                     BACKFILL_INTERVAL
                 };
@@ -3763,6 +3803,10 @@ async fn run_actor(
                 set_state_error(&ctx, account_id, "offline", &message).await;
                 for waiter in waiters.drain(..) {
                     let _ = waiter.send(Err(message.clone()));
+                }
+                if throttled {
+                    // The backoff check at the top of the loop does the wait.
+                    continue;
                 }
                 let delay = Duration::from_secs(backoff);
                 backoff = (backoff * 2).min(300);
