@@ -95,6 +95,108 @@ pub fn set_state(conn: &Connection, id: i64, state: &str) -> Result<bool> {
     Ok(n > 0)
 }
 
+/// Rule id under which category suggestions are stored (one per thread).
+pub const CATEGORY_SUGGESTION: &str = "category";
+
+/// A pending category suggestion, display-only.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CategorySuggestionRow {
+    pub id: i64,
+    pub thread_id: i64,
+    pub category_id: String,
+    pub confidence: f32,
+    pub rationale: String,
+    pub model: String,
+}
+
+/// Record category suggestions (from `category::suggest_llm`). Existing rows
+/// for a thread keep their state.
+pub fn record_category(
+    conn: &Connection,
+    items: &[crate::category::suggest_llm::CategorySuggestion],
+    model: &str,
+) -> Result<usize> {
+    let now = now_secs();
+    let mut stmt = conn.prepare_cached(
+        "INSERT INTO ai_suggestions (thread_id, rule_id, rule_name, model, created_at,
+                                     category_id, confidence, rationale)
+         VALUES (?1, ?2, '', ?3, ?4, ?5, ?6, ?7)
+         ON CONFLICT(thread_id, rule_id) DO NOTHING",
+    )?;
+    let mut n = 0;
+    for s in items {
+        n += stmt.execute(params![
+            s.thread_id,
+            CATEGORY_SUGGESTION,
+            model,
+            now,
+            s.category_id,
+            f64::from(s.confidence),
+            s.rationale
+        ])?;
+    }
+    Ok(n)
+}
+
+/// Mark threads as asked without a suggestion (`expired`, no category).
+pub fn mark_category_asked(conn: &Connection, thread_ids: &[i64], model: &str) -> Result<()> {
+    let now = now_secs();
+    let mut stmt = conn.prepare_cached(
+        "INSERT INTO ai_suggestions (thread_id, rule_id, model, state, created_at, decided_at)
+         VALUES (?1, ?2, ?3, 'expired', ?4, ?4)
+         ON CONFLICT(thread_id, rule_id) DO NOTHING",
+    )?;
+    for tid in thread_ids {
+        stmt.execute(params![tid, CATEGORY_SUGGESTION, model, now])?;
+    }
+    Ok(())
+}
+
+pub fn list_pending_categories(
+    conn: &Connection,
+    limit: i64,
+) -> Result<Vec<CategorySuggestionRow>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT id, thread_id, COALESCE(category_id, ''), COALESCE(confidence, 0), rationale, model
+         FROM ai_suggestions WHERE state = 'pending' AND rule_id = ?1
+         ORDER BY created_at DESC, id DESC LIMIT ?2",
+    )?;
+    let rows = stmt
+        .query_map(params![CATEGORY_SUGGESTION, limit], |r| {
+            Ok(CategorySuggestionRow {
+                id: r.get(0)?,
+                thread_id: r.get(1)?,
+                category_id: r.get(2)?,
+                confidence: r.get::<_, f64>(3)? as f32,
+                rationale: r.get(4)?,
+                model: r.get(5)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+pub fn get_category(conn: &Connection, id: i64) -> Result<Option<CategorySuggestionRow>> {
+    use rusqlite::OptionalExtension;
+    Ok(conn
+        .query_row(
+            "SELECT id, thread_id, COALESCE(category_id, ''), COALESCE(confidence, 0), rationale, model
+             FROM ai_suggestions WHERE id = ?1 AND rule_id = ?2 AND state = 'pending'",
+            params![id, CATEGORY_SUGGESTION],
+            |r| {
+                Ok(CategorySuggestionRow {
+                    id: r.get(0)?,
+                    thread_id: r.get(1)?,
+                    category_id: r.get(2)?,
+                    confidence: r.get::<_, f64>(3)? as f32,
+                    rationale: r.get(4)?,
+                    model: r.get(5)?,
+                })
+            },
+        )
+        .optional()?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -120,6 +222,51 @@ mod tests {
             rule_name: "Invoices".into(),
             model: "m".into(),
         }
+    }
+
+    #[test]
+    fn malicious_category_output_only_adds_one_pending_row() {
+        let conn = db();
+        conn.execute_batch(
+            "INSERT INTO folders (id, account_id, imap_name, role) VALUES (1, 1, 'INBOX', 'inbox');
+             INSERT INTO messages (id, account_id, thread_id, folder_id, uid, subject, from_addr,
+               to_json, cc_json, date, snippet, is_read)
+             VALUES (1, 1, 1, 1, 7, 'Invoice', 'b@x.test', '[]', '[]', 1, 's', 0);",
+        )
+        .unwrap();
+        let snapshot = |c: &Connection| -> (i64, i64, i64) {
+            c.query_row(
+                "SELECT (SELECT COUNT(*) FROM message_labels), is_read, folder_id FROM messages WHERE id = 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap()
+        };
+        let before = snapshot(&conn);
+        let cats = crate::category::repo::list_categories(&conn).unwrap();
+        let items = vec![crate::category::suggest_llm::SuggestInput {
+            thread_id: 1,
+            from: "b@x.test".into(),
+            subject: "Invoice".into(),
+            body: "s".into(),
+        }];
+        let out =
+            r#"{"r":[{"i":0,"c":"bills","p":0.9,"why":"x","action":"trash"}],"archive":true}"#;
+        let parsed = crate::category::suggest_llm::parse(out, &cats, &items);
+        assert_eq!(record_category(&conn, &parsed, "m").unwrap(), 1);
+        mark_category_asked(&conn, &[1], "m").unwrap();
+        let pending = list_pending_categories(&conn, 10).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].category_id, "bills");
+        assert_eq!(
+            snapshot(&conn),
+            before,
+            "labels, read state and folder unchanged"
+        );
+        assert_eq!(
+            crate::category::repo::thread_category(&conn, 1).unwrap(),
+            None
+        );
     }
 
     #[test]

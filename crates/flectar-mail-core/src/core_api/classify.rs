@@ -11,6 +11,21 @@ impl Core {
     /// configured actions are never executed from AI output.
     pub async fn classify_pending(&self, limit: i64) -> Result<i64> {
         let _guard = self.ai_router_lock.lock().await;
+        // Siftmail M2: deterministic user rules run first, independent of AI.
+        let rule_matches = self.apply_category_rules(limit).await.unwrap_or_else(|e| {
+            tracing::warn!("category rules failed: {e}");
+            0
+        });
+        // Threads no rule matched may get an advisory AI suggestion.
+        if let Err(e) = self
+            .suggest_categories(category::suggest_llm::MAX_BATCH as i64)
+            .await
+        {
+            tracing::warn!("category suggestions failed: {e}");
+        }
+        if rule_matches > 0 {
+            return Ok(rule_matches);
+        }
         let settings = self.db.read(|conn| repo::settings::get(conn)).await?;
         if !settings.ai_categorize {
             return Ok(0);

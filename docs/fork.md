@@ -39,3 +39,18 @@ stay manageable.
 - At most 2 polling connections per provider at a time.
 - Not yet covered: Gmail API and JMAP actors, the backfill pool / dedicated
   body-reader connections, and the settings/status UI.
+
+## Categories and rules (M2)
+- `crate::category`: `categories`, `category_rules`, `rule_conditions`,
+  `thread_categories` (migration 015, seeds 账单/订阅/通知/VPS警告/应用运行状态
+  plus two disabled example rules).
+- Conditions: from_address / from_domain / from_name / to / subject / body
+  (body = stored snippet) × equals / contains / wildcard (`*`,`?`) / regex
+  (size-limited) / exists, with case-sensitivity and negate; all/any mode;
+  first match by priority wins. Domains compare case- and IDN-insensitively.
+- Rules run first in `classify_pending`, independent of AI. Actions are only
+  `RuleAction::{ApplyCategory, Star, MarkRead}` (star/read only when ticked).
+- AI fallback: `Core::suggest_categories` batches ≤15 unmatched threads with
+  nonce-fenced content; output validated against enabled category ids and
+  stored as pending `ai_suggestions` rows (`rule_id = 'category'`). Accepting
+  is an explicit user command (`accept_category_suggestion`).
