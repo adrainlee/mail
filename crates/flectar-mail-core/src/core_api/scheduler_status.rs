@@ -11,6 +11,8 @@ pub struct ProviderSchedule {
     pub backoff: Option<BackoffState>,
     /// Milliseconds still to wait; 0 when the provider may connect.
     pub remaining_ms: i64,
+    /// Accounts of this provider that keep a push channel open.
+    pub push_emails: Vec<String>,
 }
 
 pub(crate) fn provider_schedules(
@@ -21,14 +23,23 @@ pub(crate) fn provider_schedules(
     let mut rows: Vec<ProviderSchedule> = Vec::new();
     for c in configs {
         let key = scheduler::account_provider_key(c);
-        match rows.iter_mut().find(|r| r.provider == key) {
-            Some(r) => r.account_emails.push(c.email.clone()),
-            None => rows.push(ProviderSchedule {
-                provider: key,
-                account_emails: vec![c.email.clone()],
-                backoff: None,
-                remaining_ms: 0,
-            }),
+        let push = c.settings.sync_schedule.push_for(c);
+        let idx = match rows.iter().position(|r| r.provider == key) {
+            Some(i) => i,
+            None => {
+                rows.push(ProviderSchedule {
+                    provider: key,
+                    account_emails: Vec::new(),
+                    backoff: None,
+                    remaining_ms: 0,
+                    push_emails: Vec::new(),
+                });
+                rows.len() - 1
+            }
+        };
+        rows[idx].account_emails.push(c.email.clone());
+        if push {
+            rows[idx].push_emails.push(c.email.clone());
         }
     }
     for b in backoffs {
@@ -43,6 +54,7 @@ pub(crate) fn provider_schedules(
                 account_emails: Vec::new(),
                 remaining_ms,
                 backoff: Some(b),
+                push_emails: Vec::new(),
             }),
         }
     }

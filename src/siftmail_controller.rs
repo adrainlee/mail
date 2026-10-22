@@ -86,6 +86,7 @@ fn refresh_scheduler(ctx: &Ctx) {
                         .unwrap_or_default()
                         .into(),
                     backing_off: r.remaining_ms > 0,
+                    push: r.push_emails.join(", ").into(),
                 })
                 .collect();
             app.global::<SiftmailBridge>()

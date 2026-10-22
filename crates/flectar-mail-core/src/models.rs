@@ -306,8 +306,11 @@ pub struct AccountSettings {
 pub struct SyncSchedule {
     pub base_minutes: u32,
     pub jitter_minutes: u32,
-    /// Keep an IMAP IDLE connection open for near-real-time mail.
-    pub idle_push: bool,
+    /// Keep a push channel open (IMAP IDLE, Gmail/JMAP push) for
+    /// near-real-time mail. `None` = protocol default: IMAP stays quiet
+    /// (hourly polling), Gmail API and JMAP keep the push they always had.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub idle_push: Option<bool>,
 }
 
 impl Default for SyncSchedule {
@@ -315,12 +318,28 @@ impl Default for SyncSchedule {
         Self {
             base_minutes: 60,
             jitter_minutes: 20,
-            idle_push: false,
+            idle_push: None,
         }
     }
 }
 
 impl SyncSchedule {
+    /// Whether push is on; `push_by_default` is the protocol default.
+    pub fn push(&self, push_by_default: bool) -> bool {
+        self.idle_push.unwrap_or(push_by_default)
+    }
+
+    /// Protocol default for push: Gmail API and JMAP accounts had push
+    /// before the scheduler existed and keep it; only IMAP defaults to quiet.
+    pub fn push_default_for(config: &AccountConfig) -> bool {
+        config.provider == Provider::Gmail || config.mail_protocol == MailProtocol::Jmap
+    }
+
+    /// Effective push for an account.
+    pub fn push_for(&self, config: &AccountConfig) -> bool {
+        self.push(Self::push_default_for(config))
+    }
+
     pub fn base(&self) -> std::time::Duration {
         std::time::Duration::from_secs(u64::from(self.base_minutes.clamp(1, 24 * 60)) * 60)
     }

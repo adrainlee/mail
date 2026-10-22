@@ -20,6 +20,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("migrations/015_categories.sql"),
     include_str!("migrations/016_proxies.sql"),
     include_str!("migrations/017_translations.sql"),
+    include_str!("migrations/018_sync_push_default.sql"),
 ];
 pub const LATEST_VERSION: i64 = MIGRATIONS.len() as i64;
 
@@ -923,5 +924,36 @@ mod tests {
             28
         );
         assert!(application_tables(&conn).is_empty());
+    }
+
+    #[test]
+    fn migration_018_drops_implicit_idle_push_false_only() {
+        let sql = include_str!("migrations/018_sync_push_default.sql");
+        let conn = fresh();
+        for (id, json) in [
+            (1, r#"{"syncSchedule":{"baseMinutes":60,"idlePush":false}}"#),
+            (2, r#"{"syncSchedule":{"idlePush":true}}"#),
+            (3, "not json"),
+        ] {
+            conn.execute(
+                "INSERT INTO accounts (id, email, provider, auth_kind, username, imap_host,
+                   imap_port, smtp_host, smtp_port, created_at, settings_json)
+                 VALUES (?1, ?1 || '@t.dev', 'gmail', 'oauth2', 'u', 'h', 993, 'h', 587, 0, ?2)",
+                params![id, json],
+            )
+            .unwrap();
+        }
+        conn.execute_batch(sql).unwrap();
+        let get = |id: i64| -> String {
+            conn.query_row(
+                "SELECT settings_json FROM accounts WHERE id = ?1",
+                [id],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(get(1), r#"{"syncSchedule":{"baseMinutes":60}}"#);
+        assert_eq!(get(2), r#"{"syncSchedule":{"idlePush":true}}"#);
+        assert_eq!(get(3), "not json");
     }
 }
