@@ -578,3 +578,32 @@ async fn end_to_end_against_mock_openai_server_with_streaming() {
         .position(|e| matches!(e, TranslateEvent::Block { .. }));
     assert!(first_preview < first_block);
 }
+
+#[test]
+fn overlong_single_sentences_are_cut_at_clauses_spaces_then_chars() {
+    let fits = |parts: &[String], max: usize| parts.iter().all(|p| est_tokens(p) <= max);
+    // One sentence, only commas.
+    let clauses = "alpha beta gamma delta, ".repeat(80);
+    let parts = split::split_source(&clauses, 60);
+    assert!(parts.len() > 1 && fits(&parts, 60));
+    assert_eq!(parts.concat(), clauses);
+    assert!(parts[..parts.len() - 1].iter().all(|p| p.ends_with(", ")));
+    // No punctuation at all, only spaces.
+    let words = "word ".repeat(400);
+    let parts = split::split_source(&words, 60);
+    assert!(parts.len() > 1 && fits(&parts, 60));
+    assert_eq!(parts.concat(), words);
+    // CJK without punctuation: character cuts, never inside a token.
+    let mut cjk = "汉".repeat(300);
+    cjk.push_str("⟦c12⟧");
+    cjk.push_str(&"字".repeat(300));
+    let parts = split::split_source(&cjk, 60);
+    assert!(parts.len() >= 3 && fits(&parts, 60), "{}", parts.len());
+    assert_eq!(parts.concat(), cjk);
+    assert_eq!(parts.iter().filter(|p| p.contains("⟦c12⟧")).count(), 1);
+    // Numbers are not clause ends.
+    assert_eq!(
+        split::split_source("1,000.5 ok", 60),
+        vec!["1,000.5 ok".to_string()]
+    );
+}

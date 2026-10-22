@@ -6,6 +6,8 @@ import { AppTheme } from "../design-system.slint";
 import { TypeScale } from "../typography.slint";
 import { Button } from "button.slint";
 
+export struct TranslatedLink { label: string, url: string }
+
 export global TranslationBridge {
     in-out property <bool> open: false;
     in property <[string]> languages: ["简体中文", "English", "日本語", "한국어", "Français", "Deutsch", "Español"];
@@ -18,6 +20,11 @@ export global TranslationBridge {
     in property <string> confirm-text: "";
     in property <string> translated-text: "";
     in-out property <bool> show-translated: true;
+    // Links found in the translation, listed under it so they stay clickable.
+    in property <[TranslatedLink]> links: [];
+    callback open-link(string);
+    // Bar opened: reset the language to the configured default.
+    callback opened();
     callback start(int /* language index */);
     callback confirm();
     callback cancel();
@@ -32,7 +39,7 @@ export component TranslationOverlay inherits Rectangle {
         y: parent.height - self.height - 16px;
         width: open-btn.preferred-width;
         height: open-btn.preferred-height;
-        open-btn := Button { text: @tr("Translate"); clicked => { TranslationBridge.open = true; } }
+        open-btn := Button { text: @tr("Translate"); clicked => { TranslationBridge.open = true; TranslationBridge.opened(); } }
     }
     if root.available && TranslationBridge.open : Rectangle {
         x: 8px;
@@ -52,7 +59,24 @@ export component TranslationOverlay inherits Rectangle {
                 height: parent.height;
                 VerticalLayout {
                     padding: 16px;
+                    spacing: 6px;
                     Text { text: TranslationBridge.translated-text; wrap: word-wrap; color: AppTheme.body; font-size: TypeScale.body; }
+                    if TranslationBridge.links.length > 0 : Text { text: @tr("Links"); color: AppTheme.heading; font-weight: 600; font-size: TypeScale.secondary; }
+                    for link in TranslationBridge.links : Rectangle {
+                        height: link-text.preferred-height + 4px;
+                        link-text := Text {
+                            x: 0;
+                            width: parent.width;
+                            text: link.label == link.url ? link.url : link.label + " — " + link.url;
+                            color: AppTheme.accent;
+                            wrap: word-wrap;
+                            font-size: TypeScale.secondary;
+                        }
+                        TouchArea {
+                            mouse-cursor: pointer;
+                            clicked => { TranslationBridge.open-link(link.url); }
+                        }
+                    }
                 }
             }
         }

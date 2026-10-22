@@ -850,6 +850,74 @@ pub(super) const TARGET_LANGUAGES: [&str; 7] = [
     "Spanish",
 ];
 
+/// Links in the translated output, as (label, url), so the translated view
+/// keeps them clickable. Anchors keep their (translated) label; bare
+/// http(s) URLs in the text are listed too. Only http, https and mailto.
+pub(super) fn extract_links(s: &str, is_html: bool) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    let mut push = |label: String, url: String| {
+        let url = url.trim().to_string();
+        let lower = url.to_ascii_lowercase();
+        if !(lower.starts_with("http://")
+            || lower.starts_with("https://")
+            || lower.starts_with("mailto:"))
+        {
+            return;
+        }
+        if out.iter().any(|(_, u)| *u == url) {
+            return;
+        }
+        let label = display_text(&label, true).trim().to_string();
+        out.push((if label.is_empty() { url.clone() } else { label }, url));
+    };
+    let mut text_only = String::new();
+    if is_html {
+        let lower = s.to_ascii_lowercase();
+        let mut i = 0;
+        while let Some(off) = lower[i..].find("<a") {
+            let start = i + off;
+            let Some(tag_end) = lower[start..].find('>').map(|e| start + e) else {
+                break;
+            };
+            text_only.push_str(&s[i..start]);
+            let tag = &s[start..tag_end];
+            let href = tag
+                .to_ascii_lowercase()
+                .find("href=")
+                .and_then(|h| {
+                    let v = &tag[h + 5..];
+                    let q = v.chars().next()?;
+                    if q == '"' || q == '\'' {
+                        v[1..].find(q).map(|e| v[1..1 + e].to_string())
+                    } else {
+                        Some(v.split(|c: char| c.is_whitespace()).next()?.to_string())
+                    }
+                })
+                .map(|h| h.replace("&amp;", "&"));
+            let close = lower[tag_end..].find("</a").map(|e| tag_end + e);
+            let label_end = close.unwrap_or(tag_end + 1);
+            let label = s.get(tag_end + 1..label_end).unwrap_or("").to_string();
+            if let Some(h) = href {
+                push(label, h);
+            }
+            i = close
+                .and_then(|c| lower[c..].find('>').map(|e| c + e + 1))
+                .unwrap_or(tag_end + 1);
+        }
+        text_only.push_str(&s[i.min(s.len())..]);
+    } else {
+        text_only.push_str(s);
+    }
+    for word in text_only.split(|c: char| c.is_whitespace() || c == '<' || c == '>' || c == '"') {
+        let lower = word.to_ascii_lowercase();
+        if lower.starts_with("http://") || lower.starts_with("https://") {
+            let url = word.trim_end_matches(|c: char| ".,;:!?)）。，".contains(c));
+            push(url.to_string(), url.to_string());
+        }
+    }
+    out
+}
+
 /// Readable plain text from translated HTML (or plain) output. Also drops
 /// any placeholder markers left in streaming previews.
 pub(super) fn display_text(s: &str, is_html: bool) -> String {
@@ -1001,6 +1069,7 @@ fn start_translation(ctx: &Ctx, run: &Rc<RefCell<TranslationRun>>, lang: i32, co
     b.set_total(0);
     b.set_message("".into());
     b.set_translated_text("".into());
+    set_links(&b, "", false);
     b.set_show_translated(true);
 
     // Streaming: previews and finished blocks are shown as they arrive.
@@ -1049,6 +1118,7 @@ fn start_translation(ctx: &Ctx, run: &Rc<RefCell<TranslationRun>>, lang: i32, co
                 }
                 Ok(o) => {
                     b.set_translated_text(display_text(&o.output, o.is_html).into());
+                    set_links(&b, &o.output, o.is_html);
                     b.set_phase("done".into());
                     b.set_message(
                         match o.status.as_str() {
@@ -1072,9 +1142,53 @@ fn start_translation(ctx: &Ctx, run: &Rc<RefCell<TranslationRun>>, lang: i32, co
     );
 }
 
+fn set_links(b: &TranslationBridge, output: &str, is_html: bool) {
+    let links: Vec<TranslatedLink> = extract_links(output, is_html)
+        .into_iter()
+        .map(|(label, url)| TranslatedLink {
+            label: label.into(),
+            url: url.into(),
+        })
+        .collect();
+    b.set_links(Rc::new(slint::VecModel::from(links)).into());
+}
+
+/// `TranslationBridge.languages` index for the configured target language.
+pub(super) fn language_index_for(setting: &str) -> i32 {
+    use flectar_mail_core::translate::lang::target_code;
+    let Some(code) = target_code(setting) else { return 0 };
+    TARGET_LANGUAGES
+        .iter()
+        .position(|l| target_code(l) == Some(code))
+        .map_or(0, |i| i as i32)
+}
+
+fn apply_default_language(ctx: &Ctx) {
+    ctx.spawn(
+        |core| async move { core.translate_config().await.map_err(|e| e.to_string()) },
+        |app, cfg| {
+            let b = app.global::<TranslationBridge>();
+            if b.get_phase() != "running" {
+                b.set_language_index(language_index_for(&cfg.target_lang));
+            }
+        },
+    );
+}
+
 fn register_translation(ctx: &Ctx, app: &AppWindow) {
     let run: Rc<RefCell<TranslationRun>> = Rc::default();
     let b = app.global::<TranslationBridge>();
+
+    let c = ctx.clone();
+    b.on_opened(move || apply_default_language(&c));
+    apply_default_language(ctx);
+    let weak = app.as_weak();
+    // Same safety policy as links in the message (http/https/mailto/tel).
+    b.on_open_link(move |url| {
+        if let Some(app) = weak.upgrade() {
+            app.invoke_open_email_link(url);
+        }
+    });
 
     let (c, r) = (ctx.clone(), Rc::clone(&run));
     b.on_start(move |lang| start_translation(&c, &r, lang, false));
@@ -1107,6 +1221,8 @@ fn register_translation(ctx: &Ctx, app: &AppWindow) {
             b.set_open(false);
             b.set_phase("idle".into());
             b.set_translated_text("".into());
+            set_links(&b, "", false);
+    set_links(&b, "", false);
             b.set_message("".into());
         }
     });
@@ -1151,6 +1267,39 @@ mod tests {
     fn remaining_is_rounded_up_to_minutes() {
         assert_eq!(super::format_remaining(1), "1 min");
         assert_eq!(super::format_remaining(90 * 60_000), "1 h 30 min");
+    }
+
+    #[test]
+    fn translated_links_stay_clickable_and_unsafe_schemes_are_dropped() {
+        let html = "<p>见 <a href=\"https://ex.test/r?a=1&amp;b=2\">完整<b>报告</b></a>，或 \
+                    <a href='mailto:x@ex.test'>写信</a>。<a href=\"javascript:alert(1)\">坏</a> \
+                    另见 https://docs.ex.test/p。</p>";
+        let links = super::extract_links(html, true);
+        assert_eq!(
+            links,
+            vec![
+                ("完整报告".to_string(), "https://ex.test/r?a=1&b=2".to_string()),
+                ("写信".to_string(), "mailto:x@ex.test".to_string()),
+                (
+                    "https://docs.ex.test/p".to_string(),
+                    "https://docs.ex.test/p".to_string()
+                ),
+            ]
+        );
+        assert_eq!(
+            super::extract_links("see http://a.test/x, ok", false),
+            vec![("http://a.test/x".to_string(), "http://a.test/x".to_string())]
+        );
+    }
+
+    #[test]
+    fn bar_language_follows_the_configured_target() {
+        assert_eq!(super::language_index_for("Chinese (Simplified)"), 0);
+        assert_eq!(super::language_index_for("中文"), 0);
+        assert_eq!(super::language_index_for("English"), 1);
+        assert_eq!(super::language_index_for("日本語"), 2);
+        assert_eq!(super::language_index_for("Deutsch"), 5);
+        assert_eq!(super::language_index_for("Klingon"), 0);
     }
 
     #[test]
