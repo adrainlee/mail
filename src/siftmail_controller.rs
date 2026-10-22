@@ -133,53 +133,120 @@ pub(super) fn category_id_for(name: &str, now_ms: i64) -> String {
     }
 }
 
-/// A rule the simple editor can represent: one condition, a known field/op.
-pub(super) fn simple_rule_parts(rule: &Rule) -> Option<(usize, usize, String)> {
-    let [c] = rule.conditions.as_slice() else {
-        return None;
-    };
-    if c.negate {
-        return None;
-    }
+/// Field/op indices of a condition in the editor's lists, if it has them.
+pub(super) fn condition_parts(c: &Condition) -> Option<(usize, usize)> {
     let f = RULE_FIELDS.iter().position(|x| *x == c.field)?;
     let o = RULE_OPS.iter().position(|x| *x == c.op)?;
-    Some((f, o, c.value.clone()))
+    Some((f, o))
 }
 
-pub(super) fn build_rule(
+/// Whether every condition of `rule` fits the editor.
+pub(super) fn rule_editable(rule: &Rule) -> bool {
+    rule.conditions.iter().all(|c| condition_parts(c).is_some())
+}
+
+/// One condition row of the rule editor.
+#[derive(Debug, Clone, PartialEq)]
+pub(super) struct DraftCondition {
+    pub field: usize,
+    pub op: usize,
+    pub value: String,
+    pub negate: bool,
+}
+
+/// Build a rule from the editor. Empty condition rows are ignored; at least
+/// one must remain. `base` (the rule being edited) keeps the options the
+/// editor does not show (star / mark read, case sensitivity).
+#[allow(clippy::too_many_arguments)]
+pub(super) fn rule_from_draft(
+    base: Option<&Rule>,
     id: i64,
     category_id: String,
-    name: String,
-    field: usize,
-    op: usize,
-    value: String,
+    name: &str,
+    priority: &str,
+    mode_index: i32,
     enabled: bool,
-) -> Option<Rule> {
-    let value = value.trim().to_string();
-    if value.is_empty() {
-        return None;
-    }
-    Some(Rule {
-        id,
-        name: if name.trim().is_empty() {
-            value.clone()
-        } else {
-            name.trim().to_string()
-        },
-        category_id,
-        priority: 100,
-        enabled,
-        mode: MatchMode::All,
-        conditions: vec![Condition {
-            field: *RULE_FIELDS.get(field)?,
-            op: *RULE_OPS.get(op)?,
+    conditions: &[DraftCondition],
+) -> Result<Rule, String> {
+    let mut out = Vec::new();
+    for (i, d) in conditions.iter().enumerate() {
+        let value = d.value.trim().to_string();
+        if value.is_empty() {
+            continue;
+        }
+        let field = *RULE_FIELDS.get(d.field).ok_or("unknown field")?;
+        let op = *RULE_OPS.get(d.op).ok_or("unknown operator")?;
+        let case_sensitive = base
+            .and_then(|b| b.conditions.get(i))
+            .is_some_and(|c| c.case_sensitive);
+        out.push(Condition {
+            field,
+            op,
             value,
-            case_sensitive: false,
-            negate: false,
-        }],
-        also_star: false,
-        also_mark_read: false,
+            case_sensitive,
+            negate: d.negate,
+        });
+    }
+    if out.is_empty() {
+        return Err("Add at least one condition with a value.".into());
+    }
+    let priority = match priority.trim() {
+        "" => base.map_or(100, |b| b.priority),
+        p => p
+            .parse::<i32>()
+            .map_err(|_| "Priority must be a whole number (lower runs first).".to_string())?,
+    };
+    let name = match name.trim() {
+        "" => out[0].value.clone(),
+        n => n.to_string(),
+    };
+    Ok(Rule {
+        id,
+        category_id,
+        name,
+        priority,
+        enabled,
+        mode: if mode_index == 1 {
+            MatchMode::Any
+        } else {
+            MatchMode::All
+        },
+        conditions: out,
+        also_star: base.is_some_and(|b| b.also_star),
+        also_mark_read: base.is_some_and(|b| b.also_mark_read),
     })
+}
+
+/// Move rule `id` by `delta` places in evaluation order (lower priority
+/// first) and renumber 10, 20, 30…; returns only the rules that changed.
+pub(super) fn reorder_priorities(rules: &[Rule], id: i64, delta: i32) -> Vec<Rule> {
+    let mut sorted: Vec<Rule> = rules.to_vec();
+    sorted.sort_by_key(|r| (r.priority, r.id));
+    let Some(pos) = sorted.iter().position(|r| r.id == id) else {
+        return Vec::new();
+    };
+    let target = (pos as i64 + i64::from(delta)).clamp(0, sorted.len() as i64 - 1) as usize;
+    if target == pos {
+        return Vec::new();
+    }
+    let r = sorted.remove(pos);
+    sorted.insert(target, r);
+    sorted
+        .into_iter()
+        .enumerate()
+        .filter_map(|(i, mut r)| {
+            let p = (i as i32 + 1) * 10;
+            (r.priority != p).then(|| {
+                r.priority = p;
+                r
+            })
+        })
+        .collect()
+}
+
+thread_local! {
+    /// Rules as last loaded, for the editor and reordering.
+    static RULE_CACHE: RefCell<Vec<Rule>> = const { RefCell::new(Vec::new()) };
 }
 
 struct CategoryData {
@@ -238,28 +305,33 @@ fn refresh_categories(ctx: &Ctx) {
                 .rules
                 .iter()
                 .map(|r| {
-                    let simple = simple_rule_parts(r);
                     let summary = r
                         .conditions
                         .iter()
-                        .map(|c| format!("{} {} \"{}\"", c.field.as_str(), c.op.as_str(), c.value))
+                        .map(|c| {
+                            format!(
+                                "{}{} {} \"{}\"",
+                                if c.negate { "NOT " } else { "" },
+                                c.field.as_str(),
+                                c.op.as_str(),
+                                c.value
+                            )
+                        })
                         .collect::<Vec<_>>()
                         .join(if r.mode == MatchMode::All { " AND " } else { " OR " });
-                    let (f, o, v) = simple.clone().unwrap_or((0, 0, String::new()));
                     RuleItem {
                         id: r.id as i32,
                         category_index: index(&r.category_id),
                         category_name: name(&r.category_id).into(),
                         name: r.name.clone().into(),
-                        field_index: f as i32,
-                        op_index: o as i32,
-                        value: v.into(),
+                        priority: r.priority,
                         summary: summary.into(),
-                        editable: simple.is_some(),
+                        editable: rule_editable(r),
                         enabled: r.enabled,
                     }
                 })
                 .collect();
+            RULE_CACHE.with(|c| *c.borrow_mut() = d.rules.clone());
             let sugg: Vec<SuggestionItem> = d
                 .suggestions
                 .iter()
@@ -302,6 +374,106 @@ fn category_id_at(ctx: &Ctx, index: i32) -> Option<String> {
     let app = ctx.app.upgrade()?;
     let cats = app.global::<SiftmailBridge>().get_categories();
     slint::Model::row_data(&cats, usize::try_from(index).ok()?).map(|c| c.id.to_string())
+}
+
+fn open_rule_draft(ctx: &Ctx, id: i64) {
+    let Some(app) = ctx.app.upgrade() else { return };
+    let b = app.global::<SiftmailBridge>();
+    let rule = RULE_CACHE.with(|r| r.borrow().iter().find(|x| x.id == id).cloned());
+    let cats = b.get_categories();
+    let cat_index = |cid: &str| {
+        (0..slint::Model::row_count(&cats))
+            .find(|&i| slint::Model::row_data(&cats, i).is_some_and(|c| c.id == cid))
+            .map_or(0, |i| i as i32)
+    };
+    let conds: Vec<ConditionItem> = match &rule {
+        Some(r) => r
+            .conditions
+            .iter()
+            .map(|c| {
+                let (f, o) = condition_parts(c).unwrap_or((0, 0));
+                ConditionItem {
+                    field_index: f as i32,
+                    op_index: o as i32,
+                    value: c.value.clone().into(),
+                    negate: c.negate,
+                }
+            })
+            .collect(),
+        None => vec![ConditionItem {
+            field_index: 0,
+            op_index: 0,
+            value: "".into(),
+            negate: false,
+        }],
+    };
+    b.set_draft_id(id as i32);
+    b.set_draft_category_index(rule.as_ref().map_or(0, |r| cat_index(&r.category_id)));
+    b.set_draft_name(rule.as_ref().map_or(String::new(), |r| r.name.clone()).into());
+    b.set_draft_priority(rule.as_ref().map_or(100, |r| r.priority).to_string().into());
+    b.set_draft_mode_index(rule.as_ref().map_or(0, |r| i32::from(r.mode == MatchMode::Any)));
+    b.set_draft_enabled(rule.as_ref().is_none_or(|r| r.enabled));
+    b.set_draft_conditions(Rc::new(slint::VecModel::from(conds)).into());
+    b.set_draft_error("".into());
+    b.set_draft_open(true);
+}
+
+fn edit_draft_conditions(ctx: &Ctx, f: impl FnOnce(&mut Vec<ConditionItem>)) {
+    let Some(app) = ctx.app.upgrade() else { return };
+    let b = app.global::<SiftmailBridge>();
+    let mut v: Vec<ConditionItem> = slint::Model::iter(&b.get_draft_conditions()).collect();
+    f(&mut v);
+    b.set_draft_conditions(Rc::new(slint::VecModel::from(v)).into());
+}
+
+fn save_rule_draft(ctx: &Ctx) {
+    let Some(app) = ctx.app.upgrade() else { return };
+    let b = app.global::<SiftmailBridge>();
+    let Some(category_id) = category_id_at(ctx, b.get_draft_category_index()) else {
+        b.set_draft_error("Create a category first.".into());
+        return;
+    };
+    let id = i64::from(b.get_draft_id());
+    let conds: Vec<DraftCondition> = slint::Model::iter(&b.get_draft_conditions())
+        .map(|c| DraftCondition {
+            field: c.field_index.max(0) as usize,
+            op: c.op_index.max(0) as usize,
+            value: c.value.to_string(),
+            negate: c.negate,
+        })
+        .collect();
+    let base = RULE_CACHE.with(|r| r.borrow().iter().find(|x| x.id == id).cloned());
+    let rule = match rule_from_draft(
+        base.as_ref(),
+        id,
+        category_id,
+        &b.get_draft_name(),
+        &b.get_draft_priority(),
+        b.get_draft_mode_index(),
+        b.get_draft_enabled(),
+        &conds,
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            b.set_draft_error(e.into());
+            return;
+        }
+    };
+    let again = ctx.clone();
+    ctx.spawn(
+        move |core| async move {
+            core.save_category_rule(rule)
+                .await
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        },
+        move |app, ()| {
+            let b = app.global::<SiftmailBridge>();
+            b.set_draft_open(false);
+            b.set_status("Rule saved.".into());
+            refresh_categories(&again);
+        },
+    );
 }
 
 fn register_categories(ctx: &Ctx, bridge: &SiftmailBridge) {
@@ -347,26 +519,60 @@ fn register_categories(ctx: &Ctx, bridge: &SiftmailBridge) {
     });
 
     let c = ctx.clone();
-    bridge.on_save_rule(move |id, cat, name, field, op, value, enabled| {
-        let Some(category_id) = category_id_at(&c, cat) else {
+    bridge.on_edit_rule(move |id| open_rule_draft(&c, i64::from(id)));
+    let c = ctx.clone();
+    bridge.on_new_rule(move || open_rule_draft(&c, 0));
+    let c = ctx.clone();
+    bridge.on_add_condition(move || {
+        edit_draft_conditions(&c, |v| {
+            v.push(ConditionItem {
+                field_index: 0,
+                op_index: 0,
+                value: "".into(),
+                negate: false,
+            })
+        })
+    });
+    let c = ctx.clone();
+    bridge.on_remove_condition(move |i| {
+        edit_draft_conditions(&c, |v| {
+            if let Ok(i) = usize::try_from(i)
+                && i < v.len()
+            {
+                v.remove(i);
+            }
+        })
+    });
+    let c = ctx.clone();
+    bridge.on_save_draft(move || save_rule_draft(&c));
+    let c = ctx.clone();
+    bridge.on_toggle_rule(move |id| {
+        let Some(mut rule) =
+            RULE_CACHE.with(|r| r.borrow().iter().find(|x| x.id == i64::from(id)).cloned())
+        else {
             return;
         };
-        let Some(rule) = build_rule(
-            i64::from(id),
-            category_id,
-            name.to_string(),
-            field.max(0) as usize,
-            op.max(0) as usize,
-            value.to_string(),
-            enabled,
-        ) else {
-            return;
-        };
-        mutate_categories(&c, "Rule saved.", move |core| async move {
+        rule.enabled = !rule.enabled;
+        mutate_categories(&c, "Rule updated.", move |core| async move {
             core.save_category_rule(rule)
                 .await
                 .map(|_| ())
                 .map_err(|e| e.to_string())
+        });
+    });
+    let c = ctx.clone();
+    bridge.on_move_rule(move |id, delta| {
+        let changed = RULE_CACHE.with(|r| reorder_priorities(&r.borrow(), i64::from(id), delta));
+        if changed.is_empty() {
+            return;
+        }
+        mutate_categories(&c, "Rule order updated.", move |core| async move {
+            for rule in changed {
+                core.save_category_rule(rule)
+                    .await
+                    .map_err(|e| e.to_string())?;
+            }
+            Ok(())
         });
     });
 
@@ -1353,12 +1559,44 @@ mod tests {
     }
 
     #[test]
-    fn simple_rules_round_trip_through_the_editor() {
-        let r = super::build_rule(3, "work".into(), "".into(), 2, 1, " boss@x.com ".into(), true)
-            .unwrap();
+    fn rule_editor_builds_multi_condition_rules_with_priority() {
+        use super::DraftCondition as D;
+        use flectar_mail_core::category::{MatchField, MatchMode, MatchOp};
+        let d = |f, o, v: &str, n| D { field: f, op: o, value: v.into(), negate: n };
+        let conds = [d(2, 1, " boss@x.com ", false), d(0, 0, "", false), d(0, 3, "^re:", true)];
+        let r = super::rule_from_draft(None, 3, "work".into(), "", " 5 ", 1, true, &conds).unwrap();
         assert_eq!(r.name, "boss@x.com");
-        assert_eq!(super::simple_rule_parts(&r), Some((2, 1, "boss@x.com".into())));
-        assert!(super::build_rule(0, "w".into(), "".into(), 0, 0, "  ".into(), true).is_none());
-        assert!(super::build_rule(0, "w".into(), "".into(), 99, 0, "x".into(), true).is_none());
+        assert_eq!(r.priority, 5);
+        assert_eq!(r.mode, MatchMode::Any);
+        assert_eq!(r.conditions.len(), 2);
+        assert_eq!((r.conditions[0].field, r.conditions[0].op), (MatchField::FromAddress, MatchOp::Equals));
+        assert!(r.conditions[1].negate && r.conditions[1].op == MatchOp::Regex);
+        assert!(super::rule_editable(&r));
+        // Empty priority keeps the old one; bad priority and no values fail.
+        let again = super::rule_from_draft(Some(&r), 3, "work".into(), "n", "", 0, false, &conds).unwrap();
+        assert_eq!((again.priority, again.mode), (5, MatchMode::All));
+        assert!(super::rule_from_draft(None, 0, "w".into(), "", "x", 0, true, &conds).is_err());
+        assert!(super::rule_from_draft(None, 0, "w".into(), "", "", 0, true, &[d(0, 0, " ", false)]).is_err());
+        assert!(super::rule_from_draft(None, 0, "w".into(), "", "", 0, true, &[d(99, 0, "x", false)]).is_err());
+    }
+
+    #[test]
+    fn moving_a_rule_renumbers_priorities_in_order() {
+        let mk = |id, p: i32| {
+            super::rule_from_draft(None, id, "c".into(), "", &p.to_string(), 0, true, &[super::DraftCondition {
+                field: 0,
+                op: 0,
+                value: "v".into(),
+                negate: false,
+            }])
+            .unwrap()
+        };
+        let rules = vec![mk(1, 100), mk(2, 100), mk(3, 50)];
+        // order: 3, 1, 2 → move 2 up one → 3, 2, 1
+        let changed = super::reorder_priorities(&rules, 2, -1);
+        let p = |id| changed.iter().find(|r| r.id == id).map(|r| r.priority);
+        assert_eq!((p(3), p(2), p(1)), (Some(10), Some(20), Some(30)));
+        assert!(super::reorder_priorities(&rules, 3, -1).is_empty());
+        assert!(super::reorder_priorities(&rules, 9, 1).is_empty());
     }
 }
