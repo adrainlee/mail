@@ -91,6 +91,9 @@ impl Core {
     /// model forward pass entirely.
     #[cfg(feature = "local-embeddings")]
     pub(crate) async fn vector_hits(&self, text: &str, k: usize) -> Result<Vec<(i64, f32)>> {
+        if let Some(hits) = self.remote_embed.search(text, k).await.unwrap_or(None) {
+            return Ok(hits);
+        }
         let Some(embedder) = self.embed.embedder().await else {
             return Ok(Vec::new());
         };
@@ -110,8 +113,13 @@ impl Core {
     }
 
     #[cfg(not(feature = "local-embeddings"))]
-    pub(crate) async fn vector_hits(&self, _text: &str, _k: usize) -> Result<Vec<(i64, f32)>> {
-        Ok(Vec::new())
+    pub(crate) async fn vector_hits(&self, text: &str, k: usize) -> Result<Vec<(i64, f32)>> {
+        Ok(self
+            .remote_embed
+            .search(text, k)
+            .await
+            .unwrap_or(None)
+            .unwrap_or_default())
     }
 
     /// Pre-compute and cache the query embedding for `query` while the user is
@@ -153,7 +161,7 @@ impl Core {
         let ready = self.embed.embedder().await.is_some()
             && *self.embed.active_model.read().await == model_id;
         #[cfg(not(feature = "local-embeddings"))]
-        let ready = false;
+        let ready = self.remote_embed.ready().await.is_some();
         Ok(EmbeddingStatus {
             enabled,
             model: model_id,

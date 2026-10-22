@@ -48,7 +48,8 @@ async fn run(db: Db, state: Arc<EmbedState>, paths: Arc<Paths>) {
 /// One cycle. Returns Ok(true) if it embedded at least one message.
 async fn tick(db: &Db, state: &Arc<EmbedState>, paths: &Arc<Paths>) -> Result<bool> {
     let settings = db.read(|conn| repo::settings::get(conn)).await?;
-    if settings.embedding_backend != "local" {
+    // Siftmail: also stand in while the configured remote service is down.
+    if settings.embedding_backend != "local" && !crate::embed::remote::fallback_active() {
         // Disabled: drop any loaded model so we don't pin memory.
         if state.embedder().await.is_some() {
             *state.local.write().await = None;
