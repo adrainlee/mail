@@ -37,6 +37,7 @@ pub mod signatures;
 pub mod smtp;
 pub mod suggest;
 pub mod sync;
+pub mod translate;
 pub mod unsubscribe;
 
 use crate::accounts::credentials::{self, CredentialStoreHandle, Slot};

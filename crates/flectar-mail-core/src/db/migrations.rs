@@ -19,6 +19,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("migrations/014_provider_backoff.sql"),
     include_str!("migrations/015_categories.sql"),
     include_str!("migrations/016_proxies.sql"),
+    include_str!("migrations/017_translations.sql"),
 ];
 pub const LATEST_VERSION: i64 = MIGRATIONS.len() as i64;
 
@@ -152,6 +153,8 @@ mod tests {
             "sync_failures",
             "thread_categories",
             "threads",
+            "translation_chunks",
+            "translations",
         ]
         .into_iter()
         .map(str::to_owned)
