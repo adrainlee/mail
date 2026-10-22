@@ -775,6 +775,284 @@ fn register_embedding(ctx: &Ctx, bridge: &SiftmailBridge) {
     });
 }
 
+// ---- translation bar ---------------------------------------------------
+
+use flectar_mail_core::translate::{TranslateConfig, TranslateEvent};
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// Target names sent to the model, matching `TranslationBridge.languages`.
+pub(super) const TARGET_LANGUAGES: [&str; 7] = [
+    "Chinese (Simplified)",
+    "English",
+    "Japanese",
+    "Korean",
+    "French",
+    "German",
+    "Spanish",
+];
+
+/// Readable plain text from translated HTML (or plain) output. Also drops
+/// any placeholder markers left in streaming previews.
+pub(super) fn display_text(s: &str, is_html: bool) -> String {
+    let mut out = String::with_capacity(s.len());
+    if is_html {
+        let mut in_tag = false;
+        let mut tag = String::new();
+        for c in s.chars() {
+            match (in_tag, c) {
+                (false, '<') => {
+                    in_tag = true;
+                    tag.clear();
+                }
+                (true, '>') => {
+                    in_tag = false;
+                    let name = tag
+                        .trim_start_matches('/')
+                        .split(|c: char| c.is_whitespace() || c == '/')
+                        .next()
+                        .unwrap_or("")
+                        .to_ascii_lowercase();
+                    if matches!(
+                        name.as_str(),
+                        "p" | "br" | "div" | "li" | "tr" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6"
+                            | "blockquote" | "pre" | "table"
+                    ) && !out.ends_with('\n')
+                    {
+                        out.push('\n');
+                    }
+                }
+                (true, c) => tag.push(c),
+                (false, c) => out.push(c),
+            }
+        }
+        out = out
+            .replace("&nbsp;", " ")
+            .replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace("&quot;", "\"")
+            .replace("&#39;", "'")
+            .replace("&amp;", "&");
+    } else {
+        out.push_str(s);
+    }
+    // ⟦t1⟧ / ⟦/t1⟧ / ⟦c2⟧ markers in previews.
+    let mut clean = String::with_capacity(out.len());
+    let mut skip = false;
+    for c in out.chars() {
+        match c {
+            '⟦' => skip = true,
+            '⟧' => skip = false,
+            _ if !skip => clean.push(c),
+            _ => {}
+        }
+    }
+    let mut lines: Vec<&str> = clean.lines().map(str::trim_end).collect();
+    lines.dedup_by(|a, b| a.is_empty() && b.is_empty());
+    lines.join("\n").trim().to_string()
+}
+
+fn current_message_id(state: &Rc<RefCell<InboxState>>) -> Option<i64> {
+    let s = state.borrow();
+    if let Some(m) = s.conversation_messages.get(s.conversation_selected_index) {
+        return Some(i64::from(m.id));
+    }
+    s.selected_id.map(i64::from)
+}
+
+#[derive(Default)]
+struct TranslationRun {
+    cancel: Option<Arc<AtomicBool>>,
+    message_id: Option<i64>,
+    generation: u64,
+}
+
+fn tr_bridge(ctx: &Ctx) -> Option<(AppWindow, ())> {
+    ctx.app.upgrade().map(|a| (a, ()))
+}
+
+fn start_translation(ctx: &Ctx, run: &Rc<RefCell<TranslationRun>>, lang: i32, confirmed: bool) {
+    let Some((app, ())) = tr_bridge(ctx) else { return };
+    let b = app.global::<TranslationBridge>();
+    let Some(message_id) = current_message_id(&ctx.state) else {
+        b.set_message("Select a message first.".into());
+        return;
+    };
+    let target = TARGET_LANGUAGES
+        .get(usize::try_from(lang).unwrap_or(0))
+        .copied()
+        .unwrap_or(TARGET_LANGUAGES[0])
+        .to_string();
+    let cfg = TranslateConfig {
+        target_lang: target.clone(),
+        ..TranslateConfig::default()
+    };
+    if !confirmed {
+        b.set_phase("estimating".into());
+        b.set_message("Estimating size…".into());
+        let c = ctx.clone();
+        let r = Rc::clone(run);
+        let est_cfg = cfg.clone();
+        ctx.spawn(
+            move |core| async move {
+                core.estimate_translation(message_id, est_cfg)
+                    .await
+                    .map_err(|e| e.to_string())
+            },
+            move |app, est| {
+                let b = app.global::<TranslationBridge>();
+                if est.already_in_target {
+                    b.set_phase("idle".into());
+                    b.set_message(format!("This message is already in {target}.").into());
+                } else if est.needs_confirmation {
+                    let cost = est
+                        .est_cost
+                        .map(|c| format!(", about ${c:.2}"))
+                        .unwrap_or_default();
+                    b.set_confirm_text(
+                        format!(
+                            "Translating it needs {} requests and roughly {} input tokens{cost}. Continue?",
+                            est.chunks, est.input_tokens
+                        )
+                        .into(),
+                    );
+                    b.set_phase("confirm".into());
+                    b.set_message("".into());
+                } else {
+                    start_translation(&c, &r, lang, true);
+                }
+            },
+        );
+        return;
+    }
+
+    // Run.
+    let cancel = Arc::new(AtomicBool::new(false));
+    let generation = {
+        let mut r = run.borrow_mut();
+        if let Some(old) = r.cancel.take() {
+            old.store(true, Ordering::Relaxed);
+        }
+        r.cancel = Some(cancel.clone());
+        r.message_id = Some(message_id);
+        r.generation += 1;
+        r.generation
+    };
+    b.set_phase("running".into());
+    b.set_done(0);
+    b.set_total(0);
+    b.set_message("".into());
+    b.set_translated_text("".into());
+    b.set_show_translated(true);
+
+    // Streaming: previews and finished blocks are shown as they arrive.
+    let weak = ctx.app.clone();
+    let parts: Arc<std::sync::Mutex<std::collections::BTreeMap<u32, String>>> = Default::default();
+    let on_event: Arc<dyn Fn(TranslateEvent) + Send + Sync> = Arc::new(move |e| {
+        let weak = weak.clone();
+        let parts = parts.clone();
+        let update = move |app: AppWindow| {
+            let b = app.global::<TranslationBridge>();
+            match e {
+                TranslateEvent::Progress { done, total } => {
+                    b.set_done(done as i32);
+                    b.set_total(total as i32);
+                }
+                TranslateEvent::Block { idx, text } | TranslateEvent::Preview { idx, text } => {
+                    let joined = {
+                        let mut p = parts.lock().unwrap_or_else(|e| e.into_inner());
+                        p.insert(idx, text);
+                        p.values().cloned().collect::<Vec<_>>().join("\n\n")
+                    };
+                    b.set_translated_text(display_text(&joined, true).into());
+                }
+            }
+        };
+        let _ = weak.upgrade_in_event_loop(update);
+    });
+    let r = Rc::clone(run);
+    ctx.spawn(
+        move |core| async move {
+            Ok(core
+                .translate_message(message_id, cfg, cancel, Some(on_event))
+                .await
+                .map_err(|e| e.to_string()))
+        },
+        move |app, result| {
+            if r.borrow().generation != generation {
+                return;
+            }
+            r.borrow_mut().cancel = None;
+            let b = app.global::<TranslationBridge>();
+            match result {
+                Ok(o) if o.status == "same_language" => {
+                    b.set_phase("idle".into());
+                    b.set_message("Already in the target language.".into());
+                }
+                Ok(o) => {
+                    b.set_translated_text(display_text(&o.output, o.is_html).into());
+                    b.set_phase("done".into());
+                    b.set_message(
+                        match o.status.as_str() {
+                            "done" => "Translated (view only; the message is unchanged).".to_string(),
+                            _ => format!(
+                                "Partly translated: {} of {} parts; {} blocks kept in the original. Translate again to continue.",
+                                o.chunks_done,
+                                o.chunks_total,
+                                o.failed_blocks.len()
+                            ),
+                        }
+                        .into(),
+                    );
+                }
+                Err(e) => {
+                    b.set_phase("error".into());
+                    b.set_message(format!("Translation failed: {e}").into());
+                }
+            }
+        },
+    );
+}
+
+fn register_translation(ctx: &Ctx, app: &AppWindow) {
+    let run: Rc<RefCell<TranslationRun>> = Rc::default();
+    let b = app.global::<TranslationBridge>();
+
+    let (c, r) = (ctx.clone(), Rc::clone(&run));
+    b.on_start(move |lang| start_translation(&c, &r, lang, false));
+    let (c, r) = (ctx.clone(), Rc::clone(&run));
+    b.on_confirm(move || {
+        let Some(app) = c.app.upgrade() else { return };
+        let lang = app.global::<TranslationBridge>().get_language_index();
+        start_translation(&c, &r, lang, true);
+    });
+    let (c, r) = (ctx.clone(), Rc::clone(&run));
+    b.on_cancel(move || {
+        if let Some(flag) = r.borrow_mut().cancel.take() {
+            flag.store(true, Ordering::Relaxed);
+        }
+        if let Some(app) = c.app.upgrade() {
+            let b = app.global::<TranslationBridge>();
+            b.set_phase("idle".into());
+            b.set_message("Cancelled; finished parts are kept.".into());
+        }
+    });
+    let (c, r) = (ctx.clone(), Rc::clone(&run));
+    b.on_close(move || {
+        let mut run = r.borrow_mut();
+        if let Some(flag) = run.cancel.take() {
+            flag.store(true, Ordering::Relaxed);
+        }
+        run.generation += 1;
+        if let Some(app) = c.app.upgrade() {
+            let b = app.global::<TranslationBridge>();
+            b.set_open(false);
+            b.set_phase("idle".into());
+            b.set_translated_text("".into());
+            b.set_message("".into());
+        }
+    });
+}
+
 pub(super) fn register(
     app: &AppWindow,
     state: &Rc<RefCell<InboxState>>,
@@ -805,6 +1083,7 @@ pub(super) fn register(
     register_categories(&ctx, &bridge);
     register_proxies(&ctx, &bridge);
     register_embedding(&ctx, &bridge);
+    register_translation(&ctx, app);
 }
 
 #[cfg(test)]
@@ -813,6 +1092,17 @@ mod tests {
     fn remaining_is_rounded_up_to_minutes() {
         assert_eq!(super::format_remaining(1), "1 min");
         assert_eq!(super::format_remaining(90 * 60_000), "1 h 30 min");
+    }
+
+    #[test]
+    fn display_text_strips_markup_and_placeholders() {
+        let t = super::display_text(
+            "<h1>标题</h1><p>见 <a href=\"x\">报告</a> &amp; 附件</p><p>⟦t1⟧预览⟦/t1⟧</p>",
+            true,
+        );
+        assert_eq!(t, "标题\n见 报告 & 附件\n预览");
+        assert_eq!(super::display_text("plain ⟦c1⟧ text", false), "plain  text");
+        assert_eq!(super::TARGET_LANGUAGES.len(), 7);
     }
 
     #[test]
