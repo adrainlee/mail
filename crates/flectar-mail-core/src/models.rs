@@ -229,6 +229,9 @@ pub struct MailConnectionSettings {
     pub trusted_certificate_pem: String,
     /// Siftmail M5: shared proxy (`proxies.id`) for IMAP/SMTP; `None` = direct.
     pub proxy_id: Option<i64>,
+    /// Siftmail: direct / app-wide global proxy / `proxy_id`. `None` keeps
+    /// the M5 meaning: `proxy_id` set = custom, otherwise global.
+    pub proxy_mode: Option<crate::net::proxy::ProxyMode>,
     /// Resolved from `proxy_id` when the account config is loaded.
     #[serde(skip)]
     pub proxy: Option<crate::net::proxy::ProxyConfig>,

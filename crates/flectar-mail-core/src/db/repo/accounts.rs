@@ -75,10 +75,9 @@ pub fn list_configs(conn: &Connection) -> Result<Vec<AccountConfig>> {
 /// Siftmail M5: attach the referenced proxy so every connection path (sync,
 /// folder ops, SMTP) uses the same egress.
 fn resolve_proxy(conn: &Connection, mut config: AccountConfig) -> Result<AccountConfig> {
-    config.settings.connection.proxy = match config.settings.connection.proxy_id {
-        Some(id) => crate::net::proxy::get(conn, id)?,
-        None => None,
-    };
+    config.settings.connection.proxy =
+        crate::net::proxy::resolve_for(conn, &config.settings.connection)?;
+    crate::net::proxy::remember_account_proxy(config.id, config.settings.connection.proxy.clone());
     Ok(config)
 }
 

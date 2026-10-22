@@ -593,6 +593,11 @@ impl Core {
                     _ = core.ui_ready.notified() => {}
                     _ = tokio::time::sleep(std::time::Duration::from_secs(60)) => {}
                 }
+                // Siftmail: proxy passwords must be in memory before the
+                // first connection resolves an account's proxy.
+                if let Err(e) = core.load_proxy_secrets().await {
+                    tracing::warn!("loading proxy passwords: {e}");
+                }
                 events::sync_diagnostic("startup_accounts", None, "loading");
                 let configs = match core
                     .db
