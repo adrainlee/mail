@@ -821,7 +821,7 @@ async fn run_actor(
     // Siftmail M1.5 scheduling (see sync/scheduler.rs).
     let provider = scheduler::provider_key(&config.imap_host);
     let schedule = config.settings.sync_schedule;
-    let polling = !schedule.idle_push;
+    let polling = !schedule.push(false);
     let mut provider_permit: Option<tokio::sync::OwnedSemaphorePermit> = None;
 
     if ctx.startup_stagger {

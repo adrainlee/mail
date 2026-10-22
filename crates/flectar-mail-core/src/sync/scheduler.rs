@@ -80,10 +80,11 @@ pub fn account_provider_key(config: &crate::models::AccountConfig) -> String {
 /// safety net while a push channel is open).
 pub fn next_cycle_delay(
     schedule: &crate::models::SyncSchedule,
+    push: bool,
     push_fallback: Duration,
     rng: &mut impl Rng,
 ) -> Duration {
-    if schedule.idle_push {
+    if push {
         push_fallback
     } else {
         jittered_interval(schedule.base(), schedule.jitter(), rng)
@@ -475,6 +476,27 @@ mod tests {
         .expect("permit released");
     }
 
+    fn test_config() -> crate::models::AccountConfig {
+        use crate::models::{AccountConfig, AuthKind, MailProtocol, Provider};
+        AccountConfig {
+            id: 1,
+            email: "a@x".into(),
+            display_name: None,
+            avatar_url: None,
+            provider: Provider::Imap,
+            auth_kind: AuthKind::Password,
+            mail_protocol: MailProtocol::Imap,
+            username: "a".into(),
+            jmap_url: String::new(),
+            jmap_account_id: None,
+            imap_host: String::new(),
+            imap_port: 993,
+            smtp_host: String::new(),
+            smtp_port: 465,
+            settings: Default::default(),
+        }
+    }
+
     #[test]
     fn every_account_type_has_a_provider_key() {
         use crate::models::{AccountConfig, AuthKind, MailProtocol, Provider};
@@ -508,13 +530,39 @@ mod tests {
     #[test]
     fn next_cycle_delay_polls_on_schedule_or_uses_push_fallback() {
         let mut rng = StdRng::seed_from_u64(7);
-        let mut s = crate::models::SyncSchedule::default();
-        let d = next_cycle_delay(&s, Duration::from_secs(5), &mut rng);
+        let s = crate::models::SyncSchedule::default();
+        let d = next_cycle_delay(&s, false, Duration::from_secs(5), &mut rng);
         assert!(d >= Duration::from_secs(40 * 60) && d <= Duration::from_secs(80 * 60));
-        s.idle_push = true;
         assert_eq!(
-            next_cycle_delay(&s, Duration::from_secs(5), &mut rng),
+            next_cycle_delay(&s, true, Duration::from_secs(5), &mut rng),
             Duration::from_secs(5)
         );
+    }
+
+    #[test]
+    fn push_defaults_keep_gmail_and_jmap_push_and_quiet_imap() {
+        use crate::models::{MailProtocol, Provider, SyncSchedule};
+        let mut c = test_config();
+        c.provider = Provider::Imap;
+        c.mail_protocol = MailProtocol::Imap;
+        let quiet = SyncSchedule::default();
+        assert!(!quiet.push_for(&c));
+        c.mail_protocol = MailProtocol::Jmap;
+        assert!(quiet.push_for(&c));
+        c.mail_protocol = MailProtocol::Imap;
+        c.provider = Provider::Gmail;
+        assert!(quiet.push_for(&c));
+        // An explicit choice always wins.
+        let off = SyncSchedule {
+            idle_push: Some(false),
+            ..quiet
+        };
+        assert!(!off.push_for(&c));
+        // Old settings JSON with `idlePush: false` written before this change
+        // still parses; missing field means protocol default.
+        let parsed: SyncSchedule = serde_json::from_str(r#"{"baseMinutes":30}"#).unwrap();
+        assert_eq!(parsed.idle_push, None);
+        let explicit: SyncSchedule = serde_json::from_str(r#"{"idlePush":true}"#).unwrap();
+        assert_eq!(explicit.idle_push, Some(true));
     }
 }

@@ -14,6 +14,7 @@ export struct SchedulerRow {
     remaining: string,
     last-error: string,
     backing-off: bool,
+    push: string,
 }
 
 export struct CategoryItem { id: string, name: string, description: string }
@@ -115,6 +116,13 @@ export component SchedulerPanel inherits VerticalLayout {
         alignment: start;
         spacing: 8px;
         Button { text: @tr("Refresh"); clicked => { SiftmailBridge.refresh-scheduler(); } }
+        Text { text: @tr("Updates automatically every 15 seconds."); color: AppTheme.muted; font-size: TypeScale.secondary; vertical-alignment: center; }
+    }
+    // Live countdowns and backoff changes without pressing Refresh.
+    Timer {
+        interval: 15s;
+        running: SiftmailBridge.page == "scheduler";
+        triggered => { SiftmailBridge.refresh-scheduler(); }
     }
     if SiftmailBridge.scheduler-rows.length == 0 : Text { text: @tr("No accounts yet."); color: AppTheme.muted; }
     for row in SiftmailBridge.scheduler-rows : Rectangle {
@@ -131,6 +139,7 @@ export component SchedulerPanel inherits VerticalLayout {
                 spacing: 2px;
                 Text { text: row.provider; color: AppTheme.heading; font-weight: 600; }
                 Text { text: row.accounts; color: AppTheme.secondary; font-size: TypeScale.secondary; wrap: word-wrap; }
+                if row.push != "" : Text { text: @tr("Push: {}", row.push); color: AppTheme.secondary; font-size: TypeScale.secondary; wrap: word-wrap; }
                 if row.last-error != "" : Text { text: row.last-error; color: AppTheme.muted; font-size: TypeScale.secondary; wrap: word-wrap; }
             }
             VerticalLayout {

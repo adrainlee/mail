@@ -3717,7 +3717,9 @@ async fn run_actor(
             }
         }
         let schedule = settings_rx.borrow().sync_schedule;
-        let permit = if schedule.idle_push {
+        // Gmail keeps its push-style frequent checks unless turned off.
+        let push = schedule.push(true);
+        let permit = if push {
             None
         } else {
             Some(scheduler::acquire_provider_permit(&provider).await)
@@ -3771,6 +3773,7 @@ async fn run_actor(
                 let delay = if backfill_done {
                     scheduler::next_cycle_delay(
                         &schedule,
+                        push,
                         configured_sync_interval(&ctx.db).await,
                         &mut rand::rng(),
                     )

@@ -110,7 +110,9 @@ async fn actor(
             }
         }
         let schedule = config.settings.sync_schedule;
-        let permit = if schedule.idle_push {
+        // JMAP keeps its EventSource push unless the user turned it off.
+        let push = schedule.push(true);
+        let permit = if push {
             None
         } else {
             Some(crate::sync::scheduler::acquire_provider_permit(&provider).await)
@@ -168,11 +170,12 @@ async fn actor(
         };
         let normal = crate::sync::scheduler::next_cycle_delay(
             &schedule,
+            push,
             configured_sync_interval(&ctx.db).await,
             &mut rand::rng(),
         );
         // Push (EventSource) only when the account opted into it.
-        let connected = connected.filter(|_| schedule.idle_push);
+        let connected = connected.filter(|_| push);
         let delay = if retry == 1 {
             normal
         } else {
