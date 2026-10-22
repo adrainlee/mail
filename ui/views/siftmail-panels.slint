@@ -18,7 +18,8 @@ export struct SchedulerRow {
 }
 
 export struct CategoryItem { id: string, name: string, description: string }
-export struct RuleItem { id: int, category-index: int, category-name: string, name: string, field-index: int, op-index: int, value: string, summary: string, editable: bool, enabled: bool }
+export struct RuleItem { id: int, category-index: int, category-name: string, name: string, priority: int, summary: string, editable: bool, enabled: bool }
+export struct ConditionItem { field-index: int, op-index: int, value: string, negate: bool }
 export struct SuggestionItem { id: int, title: string, category-index: int, category-name: string, confidence: string, rationale: string }
 
 export struct ProxyItem { id: int, name: string, kind-index: int, host: string, port: string, username: string, has-password: bool }
@@ -45,7 +46,24 @@ export global SiftmailBridge {
     callback refresh-categories();
     callback save-category(string /* id, empty = new */, string /* name */, string /* description */);
     callback delete-category(string);
-    callback save-rule(int /* id, 0 = new */, int /* category index */, string /* name */, int /* field */, int /* op */, string /* value */, bool /* enabled */);
+    // Rule editor (multi-condition, priority). The draft lives here while open.
+    in-out property <bool> draft-open: false;
+    in-out property <int> draft-id: 0;
+    in-out property <int> draft-category-index: 0;
+    in-out property <string> draft-name: "";
+    in-out property <string> draft-priority: "100";
+    in-out property <int> draft-mode-index: 0;
+    in-out property <bool> draft-enabled: true;
+    in-out property <[ConditionItem]> draft-conditions: [];
+    in-out property <string> draft-error: "";
+    out property <[string]> rule-modes: [@tr("All conditions (AND)"), @tr("Any condition (OR)")];
+    callback edit-rule(int);
+    callback new-rule();
+    callback add-condition();
+    callback remove-condition(int);
+    callback save-draft();
+    callback toggle-rule(int);
+    callback move-rule(int /* id */, int /* -1 up, +1 down */);
     callback delete-rule(int);
     callback apply-rules-now();
     callback run-ai-suggestions();
@@ -192,30 +210,54 @@ export component CategoriesPanel inherits VerticalLayout {
     Card {
         SectionTitle { text: @tr("Rules"); }
         Text { text: @tr("Rules run before AI and only assign a category. Match by subject, keyword or sender."); wrap: word-wrap; color: AppTheme.secondary; font-size: TypeScale.secondary; }
+        Text { text: @tr("Rules run in priority order (lower number first); the first match wins."); color: AppTheme.muted; font-size: TypeScale.secondary; wrap: word-wrap; }
         for r in SiftmailBridge.rules : HorizontalLayout {
             spacing: 6px;
-            if !r.editable : Text { text: r.name + " → " + r.category-name + " · " + r.summary; color: AppTheme.body; horizontal-stretch: 1; vertical-alignment: center; wrap: word-wrap; }
-            if r.editable : HorizontalLayout {
-                horizontal-stretch: 1;
-                spacing: 6px;
-                rname := LineEdit { text: r.name; width: 120px; input-label: @tr("Rule name"); }
-                rfield := ComboBox { model: SiftmailBridge.rule-fields; current-index: r.field-index; width: 140px; }
-                rop := ComboBox { model: SiftmailBridge.rule-ops; current-index: r.op-index; width: 110px; }
-                rval := LineEdit { text: r.value; horizontal-stretch: 1; input-label: @tr("Value"); }
-                rcat := ComboBox { model: SiftmailBridge.category-names; current-index: r.category-index; width: 130px; }
-                Button { text: @tr("Save"); clicked => { SiftmailBridge.save-rule(r.id, rcat.current-index, rname.text, rfield.current-index, rop.current-index, rval.text, r.enabled); } }
-            }
-            Button { text: r.enabled ? @tr("Disable") : @tr("Enable"); enabled: r.editable; clicked => { SiftmailBridge.save-rule(r.id, r.category-index, r.name, r.field-index, r.op-index, r.value, !r.enabled); } }
+            Text { text: "#" + r.priority; color: AppTheme.muted; vertical-alignment: center; width: 44px; }
+            Text { text: r.name + " → " + r.category-name + " · " + r.summary; color: r.enabled ? AppTheme.body : AppTheme.muted; horizontal-stretch: 1; vertical-alignment: center; wrap: word-wrap; }
+            Button { text: "↑"; clicked => { SiftmailBridge.move-rule(r.id, -1); } }
+            Button { text: "↓"; clicked => { SiftmailBridge.move-rule(r.id, 1); } }
+            Button { text: @tr("Edit"); enabled: r.editable; clicked => { SiftmailBridge.edit-rule(r.id); } }
+            Button { text: r.enabled ? @tr("Disable") : @tr("Enable"); clicked => { SiftmailBridge.toggle-rule(r.id); } }
             Button { text: @tr("Delete"); destructive: true; clicked => { SiftmailBridge.delete-rule(r.id); } }
         }
-        HorizontalLayout {
-            spacing: 6px;
-            nname := LineEdit { placeholder-text: @tr("Rule name"); width: 120px; input-label: @tr("Rule name"); }
-            nfield := ComboBox { model: SiftmailBridge.rule-fields; current-index: 0; width: 140px; }
-            nop := ComboBox { model: SiftmailBridge.rule-ops; current-index: 0; width: 110px; }
-            nval := LineEdit { placeholder-text: @tr("Text to match"); horizontal-stretch: 1; input-label: @tr("Value"); }
-            ncat := ComboBox { model: SiftmailBridge.category-names; current-index: 0; width: 130px; }
-            Button { text: @tr("Add rule"); primary: true; enabled: nval.text != "" && SiftmailBridge.category-names.length > 0; clicked => { SiftmailBridge.save-rule(0, ncat.current-index, nname.text, nfield.current-index, nop.current-index, nval.text, true); nval.text = ""; nname.text = ""; } }
+        if !SiftmailBridge.draft-open : HorizontalLayout {
+            alignment: start;
+            Button { text: @tr("New rule"); primary: true; enabled: SiftmailBridge.category-names.length > 0; clicked => { SiftmailBridge.new-rule(); } }
+        }
+        if SiftmailBridge.draft-open : Rectangle {
+            border-width: 1px;
+            border-color: AppTheme.accent;
+            border-radius: 8px;
+            height: editor.preferred-height;
+            editor := VerticalLayout {
+                padding: 10px;
+                spacing: 8px;
+                Text { text: SiftmailBridge.draft-id == 0 ? @tr("New rule") : @tr("Edit rule"); font-weight: 600; color: AppTheme.heading; }
+                HorizontalLayout {
+                    spacing: 6px;
+                    LineEdit { text <=> SiftmailBridge.draft-name; placeholder-text: @tr("Rule name"); horizontal-stretch: 1; input-label: @tr("Rule name"); }
+                    LineEdit { text <=> SiftmailBridge.draft-priority; width: 80px; input-label: @tr("Priority"); placeholder-text: "100"; }
+                    ComboBox { model: SiftmailBridge.category-names; current-index <=> SiftmailBridge.draft-category-index; width: 140px; }
+                    ComboBox { model: SiftmailBridge.rule-modes; current-index <=> SiftmailBridge.draft-mode-index; width: 190px; }
+                }
+                for c[i] in SiftmailBridge.draft-conditions : HorizontalLayout {
+                    spacing: 6px;
+                    ComboBox { model: [@tr("is"), @tr("is not")]; current-index: c.negate ? 1 : 0; width: 90px; selected => { SiftmailBridge.draft-conditions[i].negate = self.current-index == 1; } }
+                    ComboBox { model: SiftmailBridge.rule-fields; current-index: c.field-index; width: 140px; selected => { SiftmailBridge.draft-conditions[i].field-index = self.current-index; } }
+                    ComboBox { model: SiftmailBridge.rule-ops; current-index: c.op-index; width: 110px; selected => { SiftmailBridge.draft-conditions[i].op-index = self.current-index; } }
+                    LineEdit { text: c.value; horizontal-stretch: 1; placeholder-text: @tr("Text to match"); input-label: @tr("Value"); edited(v) => { SiftmailBridge.draft-conditions[i].value = v; } }
+                    Button { text: @tr("Remove"); enabled: SiftmailBridge.draft-conditions.length > 1; clicked => { SiftmailBridge.remove-condition(i); } }
+                }
+                if SiftmailBridge.draft-error != "" : Text { text: SiftmailBridge.draft-error; color: #d1242f; wrap: word-wrap; }
+                HorizontalLayout {
+                    spacing: 6px;
+                    Button { text: @tr("Add condition"); clicked => { SiftmailBridge.add-condition(); } }
+                    Rectangle { horizontal-stretch: 1; }
+                    Button { text: @tr("Cancel"); clicked => { SiftmailBridge.draft-open = false; } }
+                    Button { text: @tr("Save rule"); primary: true; clicked => { SiftmailBridge.save-draft(); } }
+                }
+            }
         }
         HorizontalLayout { alignment: start; Button { text: @tr("Apply rules to recent mail"); clicked => { SiftmailBridge.apply-rules-now(); } } }
     }
