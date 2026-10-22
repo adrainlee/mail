@@ -239,6 +239,17 @@ impl Core {
 
     /// Explicit user command: apply a suggested category to its thread.
     pub async fn accept_category_suggestion(&self, id: i64) -> Result<bool> {
+        self.accept_category_suggestion_as(id, None).await
+    }
+
+    /// Explicit user command from the review list: apply `chosen` (the
+    /// category the user picked, which may differ from the AI's guess) or the
+    /// suggested one. Only the category label is applied; nothing else runs.
+    pub async fn accept_category_suggestion_as(
+        &self,
+        id: i64,
+        chosen: Option<String>,
+    ) -> Result<bool> {
         let acceptance = UserAcceptance { suggestion_id: id };
         let applied = self
             .db
@@ -247,14 +258,21 @@ impl Core {
                 else {
                     return Ok(false);
                 };
+                let category_id = chosen.unwrap_or_else(|| row.category_id.clone());
+                if !category::repo::list_categories(conn)?
+                    .iter()
+                    .any(|c| c.id == category_id)
+                {
+                    return Err(CoreError::NotFound(format!("category {category_id}")));
+                }
                 category::repo::set_thread_category(
                     conn,
                     row.thread_id,
-                    &row.category_id,
+                    &category_id,
                     "user",
                     None,
                 )?;
-                if let Some(label) = category::repo::category_label(conn, &row.category_id)? {
+                if let Some(label) = category::repo::category_label(conn, &category_id)? {
                     route::apply_tab(conn, row.thread_id, Some(&format!("label:{label}")))?;
                 }
                 crate::suggest::set_state(conn, row.id, "accepted")
@@ -264,5 +282,29 @@ impl Core {
             self.bus.emit(CoreEvent::MailUpdated { thread_ids: vec![] });
         }
         Ok(applied)
+    }
+
+    /// Display subject + snippet for suggestion review rows.
+    pub async fn thread_titles(&self, thread_ids: Vec<i64>) -> Result<Vec<(i64, String)>> {
+        self.db
+            .read(move |conn| {
+                let mut out = Vec::new();
+                for id in thread_ids {
+                    use rusqlite::OptionalExtension;
+                    let t: Option<(Option<String>, String)> = conn
+                        .query_row(
+                            "SELECT subject_norm, snippet FROM threads WHERE id = ?1",
+                            rusqlite::params![id],
+                            |r| Ok((r.get(0)?, r.get(1)?)),
+                        )
+                        .optional()?;
+                    if let Some((subject, snippet)) = t {
+                        let title = subject.filter(|s| !s.is_empty()).unwrap_or(snippet);
+                        out.push((id, title));
+                    }
+                }
+                Ok(out)
+            })
+            .await
     }
 }
