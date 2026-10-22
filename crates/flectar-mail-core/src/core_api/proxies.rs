@@ -111,7 +111,11 @@ impl Core {
             .ok();
             proxy::cache_password(p.id, pw);
         }
-        Ok(())
+        self.refresh_global_proxy().await
+    }
+
+    async fn refresh_global_proxy(&self) -> Result<()> {
+        self.db.read(|conn| proxy::refresh_global_proxy(conn)).await
     }
 
     async fn store_proxy_password(&self, proxy_id: i64, password: Option<String>) -> Result<()> {
@@ -149,6 +153,7 @@ impl Core {
         if let Some(pw) = password {
             self.store_proxy_password(id, Some(pw)).await?;
         }
+        self.refresh_global_proxy().await?;
         Ok(id)
     }
 
@@ -163,6 +168,7 @@ impl Core {
             })
             .await?;
         self.store_proxy_password(id, None).await?;
+        self.refresh_global_proxy().await?;
         Ok(gone)
     }
 
@@ -173,7 +179,8 @@ impl Core {
     pub async fn set_global_proxy_id(&self, id: Option<i64>) -> Result<()> {
         self.db
             .write(move |conn| proxy::set_global_proxy_id(conn, id))
-            .await
+            .await?;
+        self.refresh_global_proxy().await
     }
 
     /// Choose direct / global / custom for one account.
@@ -195,6 +202,50 @@ impl Core {
                 repo::accounts::set_settings(conn, account_id, &cfg.settings)
             })
             .await
+    }
+
+    /// Siftmail: dial the server this account really uses (IMAP host, JMAP
+    /// origin or the Gmail API) through `proxy_id`, or through whatever the
+    /// account is currently set to use when `proxy_id` is `None`.
+    pub async fn test_account_proxy(
+        &self,
+        account_id: i64,
+        proxy_id: Option<i64>,
+    ) -> Result<(String, u64)> {
+        let cfg = self
+            .db
+            .read(move |conn| repo::accounts::get_config(conn, account_id))
+            .await?
+            .ok_or_else(|| CoreError::NotFound(format!("account {account_id}")))?;
+        let (host, port) = proxy::account_endpoint(&cfg);
+        let p = match proxy_id {
+            Some(id) => {
+                let mut p = self
+                    .db
+                    .read(move |conn| proxy::get(conn, id))
+                    .await?
+                    .ok_or_else(|| CoreError::NotFound(format!("proxy {id}")))?;
+                p.password = proxy::cached_password(id);
+                Some(p)
+            }
+            None => cfg.settings.connection.proxy.clone(),
+        };
+        let target = format!("{host}:{port}");
+        let ms = match p {
+            Some(p) => proxy::test_proxy(&p, &host, port).await?.as_millis() as u64,
+            None => {
+                let start = std::time::Instant::now();
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(10),
+                    tokio::net::TcpStream::connect((host.as_str(), port)),
+                )
+                .await
+                .map_err(|_| CoreError::Network(format!("{target}: timed out")))?
+                .map_err(|e| CoreError::Network(format!("{target}: {e}")))?;
+                start.elapsed().as_millis() as u64
+            }
+        };
+        Ok((target, ms))
     }
 
     /// Dial `host:port` through a saved proxy (with its stored password).

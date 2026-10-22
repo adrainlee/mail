@@ -1265,3 +1265,83 @@ async fn backup_import_preserves_transport_settings_and_rejects_private_keys() {
     assert!(core.import_account_configs(vec![config]).await.is_err());
     assert_eq!(core.list_accounts().await.unwrap().len(), 1);
 }
+
+/// Minimal no-auth SOCKS5 proxy that records each CONNECT target.
+async fn mock_socks5() -> (u16, Arc<std::sync::Mutex<Vec<String>>>) {
+    use tokio::io::AsyncReadExt;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let seen: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
+    let seen2 = seen.clone();
+    tokio::spawn(async move {
+        while let Ok((mut s, _)) = listener.accept().await {
+            let seen = seen2.clone();
+            tokio::spawn(async move {
+                let mut h = [0u8; 2];
+                s.read_exact(&mut h).await.unwrap();
+                let mut m = vec![0u8; h[1] as usize];
+                s.read_exact(&mut m).await.unwrap();
+                s.write_all(&[5, 0]).await.unwrap();
+                let mut r = [0u8; 4];
+                s.read_exact(&mut r).await.unwrap();
+                let host = match r[3] {
+                    3 => {
+                        let mut l = [0u8; 1];
+                        s.read_exact(&mut l).await.unwrap();
+                        let mut n = vec![0u8; l[0] as usize];
+                        s.read_exact(&mut n).await.unwrap();
+                        String::from_utf8(n).unwrap()
+                    }
+                    _ => {
+                        let mut ip = [0u8; 4];
+                        s.read_exact(&mut ip).await.unwrap();
+                        std::net::Ipv4Addr::from(ip).to_string()
+                    }
+                };
+                let mut pb = [0u8; 2];
+                s.read_exact(&mut pb).await.unwrap();
+                let port = u16::from_be_bytes(pb);
+                seen.lock().unwrap().push(format!("{host}:{port}"));
+                let mut t = tokio::net::TcpStream::connect((host.as_str(), port))
+                    .await
+                    .unwrap();
+                s.write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0]).await.unwrap();
+                let _ = tokio::io::copy_bidirectional(&mut s, &mut t).await;
+            });
+        }
+    });
+    (port, seen)
+}
+
+#[tokio::test]
+async fn smtp_send_tunnels_through_account_socks5_proxy() {
+    let (proxy_port, seen) = mock_socks5().await;
+    let (smtp_port, delivered, task) = smtp_test_and_delivery_server().await;
+    let mut config = smtp_config(smtp_port, ConnectionSecurity::Tls, CERT);
+    // An imported certificate is not what triggers the custom path here.
+    config.settings.connection.proxy = Some(flectar_mail_core::net::proxy::ProxyConfig {
+        id: 1,
+        name: "mock".into(),
+        kind: flectar_mail_core::net::proxy::ProxyKind::Socks5,
+        host: "127.0.0.1".into(),
+        port: proxy_port,
+        username: String::new(),
+        password: None,
+        remote_dns: true,
+    });
+    let auth = smtp::SmtpAuth::Password("pw".into());
+    smtp::test_connection(&config, &auth).await.unwrap();
+    smtp::send_raw(
+        &config,
+        &auth,
+        "user@example.com",
+        &["to@example.com".into()],
+        b"From: user@example.com\r\nTo: to@example.com\r\nSubject: via proxy\r\n\r\nhello\r\n",
+    )
+    .await
+    .unwrap();
+    assert!(delivered.await.unwrap().contains("Subject: via proxy"));
+    task.await.unwrap();
+    let seen = seen.lock().unwrap().clone();
+    assert_eq!(seen, vec![format!("127.0.0.1:{smtp_port}"); 2]);
+}
