@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 #[cfg(feature = "local-embeddings")]
 use std::sync::{Arc, Mutex};
 
+pub mod providers;
 pub mod store;
 #[cfg(feature = "local-embeddings")]
 pub mod worker;
