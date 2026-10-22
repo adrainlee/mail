@@ -8,6 +8,7 @@ pub mod autolabel;
 pub mod caldav;
 pub mod calendar;
 pub mod carddav;
+pub mod category;
 pub mod config;
 pub mod db;
 pub mod embed;

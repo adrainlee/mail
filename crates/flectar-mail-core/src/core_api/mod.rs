@@ -6,6 +6,7 @@ mod account_lifecycle;
 mod ai_assist;
 mod attachments;
 mod calendar_events;
+mod categories;
 mod classify;
 mod contacts;
 mod labels;
