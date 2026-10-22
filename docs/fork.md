@@ -23,3 +23,19 @@ stay manageable.
   changes a local view tab and does not mutate the mailbox.
 - `scripts/check-suggest-boundary.sh` (run in CI) fails if `ai/`, `embed/` or
   `suggest/` reference mailbox action types.
+
+## Sync scheduler (M1.5)
+`crates/flectar-mail-core/src/sync/scheduler.rs`, wired into the IMAP actor
+(`sync/engine.rs::run_actor`):
+- Per-account `AccountSettings.sync_schedule` (`baseMinutes` 60,
+  `jitterMinutes` 20, `idlePush` false). In polling mode (default) the actor
+  logs out after each cycle and waits `base ± jitter`.
+- Startup stagger 0–10 min when ≥ 4 accounts start together; newly added
+  accounts sync immediately.
+- Provider = registrable domain of the IMAP host. Throttle-like failures
+  (too many connections, rate limit, refused, `[UNAVAILABLE]`, …) back off the
+  whole provider 1h→2h→4h→…24h (±20 %), persisted in `provider_backoff`
+  (migration 014); a successful cycle resets. Auth failures stay per-account.
+- At most 2 polling connections per provider at a time.
+- Not yet covered: Gmail API and JMAP actors, the backfill pool / dedicated
+  body-reader connections, and the settings/status UI.

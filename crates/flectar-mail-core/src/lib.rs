@@ -603,8 +603,15 @@ impl Core {
                         return;
                     }
                 };
+                // Siftmail M1.5: stagger startup only for larger account sets;
+                // one or two accounts connect immediately as before.
+                let stagger = configs.len() >= sync::scheduler::STAGGER_MIN_ACCOUNTS;
                 for cfg in configs {
-                    core.spawn_actor(cfg).await;
+                    if stagger {
+                        core.spawn_actor_staggered(cfg).await;
+                    } else {
+                        core.spawn_actor(cfg).await;
+                    }
                 }
                 events::sync_diagnostic("startup_workers", None, "ready");
                 // Calendar sync tasks for accounts with a connected CalDAV server.
@@ -762,12 +769,25 @@ impl Core {
             paths: self.paths.clone(),
             tokens: self.tokens.clone(),
             credentials: self.credentials.clone(),
+            startup_stagger: false,
         }
     }
 
     async fn spawn_actor(&self, cfg: AccountConfig) {
         events::sync_diagnostic("spawn_worker", Some(cfg.id), "starting");
         let handle = spawn_account(self.sync_ctx(), cfg);
+        self.handles.write().await.insert(handle.account_id, handle);
+    }
+
+    /// Startup spawn (Siftmail M1.5): the first connection is delayed by a
+    /// random 0–10 minutes so many accounts never connect at once.
+    async fn spawn_actor_staggered(&self, cfg: AccountConfig) {
+        events::sync_diagnostic("spawn_worker", Some(cfg.id), "starting (staggered)");
+        let ctx = SyncCtx {
+            startup_stagger: true,
+            ..self.sync_ctx()
+        };
+        let handle = spawn_account(ctx, cfg);
         self.handles.write().await.insert(handle.account_id, handle);
     }
 

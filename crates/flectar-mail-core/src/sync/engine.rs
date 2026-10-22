@@ -26,6 +26,7 @@ use crate::imap::{self, FetchedHeader, ImapCredentials, Session};
 use crate::models::*;
 use crate::oauth::tokens::TokenProvider;
 use crate::queue;
+use crate::sync::scheduler;
 use rusqlite::OptionalExtension;
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot, watch};
@@ -249,6 +250,9 @@ pub struct SyncCtx {
     pub paths: Arc<Paths>,
     pub tokens: TokenProvider,
     pub credentials: CredentialStoreHandle,
+    /// Siftmail M1.5: delay this actor's first connection by a random
+    /// 0–10 minutes (set for accounts spawned at app startup).
+    pub startup_stagger: bool,
 }
 
 pub fn spawn_account(ctx: SyncCtx, config: AccountConfig) -> AccountHandle {
@@ -381,6 +385,52 @@ async fn run_send_dispatcher(
                     wake = wake_rx.recv() => if wake.is_none() { return },
                 }
             }
+        }
+    }
+}
+
+/// Wait until the actor receives a Sync Now (returns `true`) or is shut down
+/// (`false`). Other commands are ignored while waiting.
+async fn wait_for_sync_request(
+    rx: &mut mpsc::Receiver<SyncCmd>,
+    sync_waiters: &mut Vec<oneshot::Sender<std::result::Result<(), String>>>,
+) -> bool {
+    loop {
+        match rx.recv().await {
+            None | Some(SyncCmd::Shutdown) => return false,
+            Some(SyncCmd::SyncNow { complete }) => {
+                if let Some(complete) = complete {
+                    sync_waiters.push(complete);
+                }
+                return true;
+            }
+            Some(_) => {}
+        }
+    }
+}
+
+/// Record a provider-wide throttle if `err` looks like one. Returns `true`
+/// when the provider is now backing off.
+async fn record_provider_failure(ctx: &SyncCtx, provider: &str, err: &CoreError) -> bool {
+    if scheduler::classify_failure(err) != scheduler::FailureKind::ProviderThrottle {
+        return false;
+    }
+    let provider = provider.to_string();
+    let message = err.to_string();
+    match ctx
+        .db
+        .write(move |conn| {
+            scheduler::record_throttle(conn, &provider, &message, now_ms(), &mut rand::rng())
+        })
+        .await
+    {
+        Ok(state) => {
+            tracing::warn!(provider = %state.provider, level = state.level, "provider throttled; backing off");
+            true
+        }
+        Err(e) => {
+            tracing::warn!("could not persist provider backoff: {e}");
+            false
         }
     }
 }
@@ -768,10 +818,60 @@ async fn run_actor(
     // When the next cycle is due; only read by the waits below (any wake-up
     // from a wait runs a cycle immediately).
     let mut cycle_due;
+    // Siftmail M1.5 scheduling (see sync/scheduler.rs).
+    let provider = scheduler::provider_key(&config.imap_host);
+    let schedule = config.settings.sync_schedule;
+    let polling = !schedule.idle_push;
+    let mut provider_permit: Option<tokio::sync::OwnedSemaphorePermit> = None;
+
+    if ctx.startup_stagger {
+        let delay = scheduler::startup_delay(&mut rand::rng());
+        tracing::debug!(account_id, ?delay, "receive: staggered startup");
+        let finished =
+            tokio::time::timeout(delay, wait_for_sync_request(&mut rx, &mut sync_waiters)).await;
+        if matches!(finished, Ok(false)) {
+            return;
+        }
+    }
 
     loop {
         // 1. Ensure a connection.
         if session.is_none() {
+            // Provider-wide backoff persists across restarts. An explicit
+            // Sync Now from the user still goes through.
+            let backoff = {
+                let provider = provider.clone();
+                ctx.db
+                    .read(move |conn| scheduler::get_backoff(conn, &provider))
+                    .await
+                    .ok()
+                    .flatten()
+            };
+            if let Some(state) = backoff
+                && let Some(wait) = state.remaining(now_ms())
+            {
+                drop(provider_permit.take());
+                tracing::info!(account_id, provider = %provider, level = state.level, ?wait, "receive: provider backoff");
+                set_state_error(
+                    &ctx,
+                    account_id,
+                    "offline",
+                    &format!(
+                        "provider {} backing off (level {}): {}",
+                        provider, state.level, state.last_error
+                    ),
+                )
+                .await;
+                let finished =
+                    tokio::time::timeout(wait, wait_for_sync_request(&mut rx, &mut sync_waiters))
+                        .await;
+                if matches!(finished, Ok(false)) {
+                    return;
+                }
+            }
+            if polling && provider_permit.is_none() {
+                provider_permit = Some(scheduler::acquire_provider_permit(&provider).await);
+            }
             match connect(&ctx, &config).await {
                 Ok(mut s) => {
                     // Probe IDLE support once per connection; on error assume
@@ -816,6 +916,10 @@ async fn run_actor(
                 Err(e) => {
                     crate::events::sync_diagnostic("imap_connect", Some(account_id), e.code());
                     tracing::warn!(account_id, "imap connect failed: {e}");
+                    drop(provider_permit.take());
+                    if record_provider_failure(&ctx, &provider, &e).await {
+                        continue;
+                    }
                     ctx.bus.emit(CoreEvent::NetworkState { online: false });
                     let message = e.to_string();
                     set_state_error(&ctx, account_id, "offline", &message).await;
@@ -892,12 +996,24 @@ async fn run_actor(
         );
         // Pacing for the next cycle; also applies after errors so a flaky
         // server isn't hammered.
-        cycle_due = tokio::time::Instant::now() + configured_sync_interval(&ctx.db).await;
+        cycle_due = tokio::time::Instant::now()
+            + if polling {
+                scheduler::jittered_interval(schedule.base(), schedule.jitter(), &mut rand::rng())
+            } else {
+                configured_sync_interval(&ctx.db).await
+            };
         let mut rerun_immediately = false;
         match cycle_result {
             Ok(work_remaining) => {
                 session = Some(s);
                 cycle += 1;
+                {
+                    let provider = provider.clone();
+                    let _ = ctx
+                        .db
+                        .write(move |conn| scheduler::record_success(conn, &provider, now_ms()))
+                        .await;
+                }
                 immediate_follow_up = work_remaining;
                 // Historical content is explicitly background work. It may
                 // continue for hours without keeping the foreground account
@@ -942,6 +1058,8 @@ async fn run_actor(
             Err(e) => {
                 tracing::warn!(account_id, "sync cycle error: {e}");
                 imap::logout(s).await;
+                drop(provider_permit.take());
+                record_provider_failure(&ctx, &provider, &e).await;
                 ctx.bus.emit(CoreEvent::NetworkState { online: false });
                 let message = e.to_string();
                 set_state_error(&ctx, account_id, "offline", &message).await;
@@ -955,10 +1073,19 @@ async fn run_actor(
             continue;
         }
 
+        // Polling mode: release the connection and the provider slot between
+        // cycles so many accounts share each provider's connection budget.
+        if polling {
+            if let Some(s) = session.take() {
+                imap::logout(s).await;
+            }
+            drop(provider_permit.take());
+        }
+
         // 3. Wait for new mail (IDLE), the next cycle, or an immediate command.
         // The backfill pool drains bodies on its own connections, so the actor
         // is free to IDLE even while thousands of bodies are still downloading.
-        let use_idle = supports_idle == Some(true) && session.is_some();
+        let use_idle = !polling && supports_idle == Some(true) && session.is_some();
 
         if use_idle {
             // After a cycle the selected mailbox may be sent/drafts/etc, and

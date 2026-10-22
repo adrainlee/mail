@@ -16,6 +16,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("migrations/011_pending_body_page.sql"),
     include_str!("migrations/012_sender_identity_sources.sql"),
     include_str!("migrations/013_ai_suggestions.sql"),
+    include_str!("migrations/014_provider_backoff.sql"),
 ];
 pub const LATEST_VERSION: i64 = MIGRATIONS.len() as i64;
 
@@ -136,6 +137,7 @@ mod tests {
             "messages_fts",
             "notification_outbox",
             "pending_actions",
+            "provider_backoff",
             "route_cache",
             "sender_identities",
             "snippets",

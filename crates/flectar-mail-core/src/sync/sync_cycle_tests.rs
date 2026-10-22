@@ -183,6 +183,7 @@ async fn courier_cycle_applies_move_and_downloads_sparse_new_uid_without_uidnext
         paths,
         tokens,
         credentials,
+        startup_stagger: false,
     };
     let (mut config, action_id, inbox_id, archived_message_id) = ctx
         .db
@@ -358,6 +359,7 @@ async fn deleted_mail_context(port: u16) -> (tempfile::TempDir, SyncCtx, Account
             Arc::new(crate::oauth::redirect::LoopbackRedirectBroker::default()),
         ),
         credentials,
+        startup_stagger: false,
     };
     let (mut config, folder) = ctx
         .db
