@@ -82,8 +82,10 @@ pub fn spawn(db: Db, state: Arc<RemoteState>, credentials: CredentialStoreHandle
     tokio::spawn(async move {
         loop {
             match tick(&db, &state, &credentials).await {
-                Ok(true) => tokio::time::sleep(WORK_YIELD).await,
-                Ok(false) => tokio::time::sleep(IDLE).await,
+                Ok(busy) => {
+                    *state.last_error.write().await = None;
+                    tokio::time::sleep(if busy { WORK_YIELD } else { IDLE }).await;
+                }
                 Err(e) => {
                     tracing::warn!("remote embed worker: {e}");
                     *state.last_error.write().await = Some(e.to_string());
