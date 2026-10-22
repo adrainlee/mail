@@ -288,7 +288,7 @@ export component ProxiesPanel inherits VerticalLayout {
     spacing: 12px;
     Card {
         SectionTitle { text: @tr("Shared proxies"); }
-        Text { text: @tr("IMAP, SMTP and OAuth token refresh connect through the chosen proxy; TLS stays end to end. Passwords are kept in Windows Credential Manager, not in the database."); wrap: word-wrap; color: AppTheme.secondary; font-size: TypeScale.secondary; }
+        Text { text: @tr("IMAP, SMTP, Gmail API, Microsoft Graph, JMAP and OAuth sign-in connect through the chosen proxy; TLS stays end to end. Passwords are kept in Windows Credential Manager, not in the database."); wrap: word-wrap; color: AppTheme.secondary; font-size: TypeScale.secondary; }
         for p in SiftmailBridge.proxies : VerticalLayout {
             spacing: 4px;
             HorizontalLayout {

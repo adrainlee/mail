@@ -1599,4 +1599,42 @@ mod tests {
         assert!(super::reorder_priorities(&rules, 3, -1).is_empty());
         assert!(super::reorder_priorities(&rules, 9, 1).is_empty());
     }
+
+    #[test]
+    fn siftmail_ui_strings_are_translated_in_every_catalog() {
+        let sources = [
+            include_str!("../ui/views/siftmail-panels.slint"),
+            include_str!("../ui/components/translation-bar.slint"),
+        ];
+        let catalogs = [
+            ("de", include_str!("../lang/de/LC_MESSAGES/flectar-mail.po")),
+            ("es", include_str!("../lang/es/LC_MESSAGES/flectar-mail.po")),
+            ("fr", include_str!("../lang/fr/LC_MESSAGES/flectar-mail.po")),
+            ("ru", include_str!("../lang/ru/LC_MESSAGES/flectar-mail.po")),
+            ("tr", include_str!("../lang/tr/LC_MESSAGES/flectar-mail.po")),
+            ("zh_Hans", include_str!("../lang/zh_Hans/LC_MESSAGES/flectar-mail.po")),
+        ];
+        let mut keys = Vec::new();
+        for src in sources {
+            for part in src.split("@tr(\"").skip(1) {
+                let key = part.split('"').next().unwrap_or_default();
+                // Long ids wrap over several catalog lines; short ones are
+                // enough to catch a missing catalog update.
+                if !key.is_empty() && key.len() < 60 && !keys.contains(&key) {
+                    keys.push(key);
+                }
+            }
+        }
+        assert!(keys.len() > 50, "{}", keys.len());
+        for (lang, po) in catalogs {
+            for key in &keys {
+                let entry = format!("\nmsgid \"{key}\"\nmsgstr \"");
+                let at = po
+                    .find(&entry)
+                    .unwrap_or_else(|| panic!("{lang}: missing {key:?}"));
+                let rest = &po[at + entry.len()..];
+                assert!(!rest.starts_with("\"\n\n"), "{lang}: untranslated {key:?}");
+            }
+        }
+    }
 }
