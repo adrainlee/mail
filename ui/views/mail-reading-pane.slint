@@ -12,6 +12,7 @@ import { FocusVisibleScope } from "../components/focus-visible-scope.slint";
 import { LoadingSkeletonBlock } from "../components/loading-skeleton.slint";
 import { RenderingInfoDialog } from "../dialogs/rendering-info-dialog.slint";
 import { TypeScale } from "../typography.slint";
+import { TranslationOverlay } from "../components/translation-bar.slint";
 import { AppTheme, LayoutMetrics, MailIconPalette, MotionSettings } from "../design-system.slint";
 import { MessageColors } from "../message-colors.slint";
 import { WindowControlsClearance } from "../window-chrome.slint";
@@ -2042,4 +2043,12 @@ export component MailReadingPane inherits Rectangle {
                         root.open_email_link("https://github.com/flectar/mail/issues/new?title=Email%20rendering%20issue&body=%23%23%20What%20looked%20wrong%3F%0A%0A%23%23%20Email%20HTML%20source%0A%3C!--%20Remove%20private%20information%20before%20pasting.%20--%3E%0A");
                     }
                 }
+    // Siftmail: view-only translation bar.
+    TranslationOverlay {
+        x: 0;
+        y: 0;
+        width: root.width;
+        height: root.height;
+        available: root.selected_subject != "" || root.email_tiles.length > 0;
+    }
 }

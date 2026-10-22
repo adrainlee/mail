@@ -1,0 +1,107 @@
+// Siftmail translation bar shown over the message view. View-only: it never
+// changes the message. State lives in `TranslationBridge`, driven by
+// src/siftmail_controller.rs.
+import { ComboBox, ScrollView } from "std-widgets.slint";
+import { AppTheme } from "../design-system.slint";
+import { TypeScale } from "../typography.slint";
+import { Button } from "button.slint";
+
+export global TranslationBridge {
+    in-out property <bool> open: false;
+    in property <[string]> languages: ["简体中文", "English", "日本語", "한국어", "Français", "Deutsch", "Español"];
+    in-out property <int> language-index: 0;
+    // idle | estimating | confirm | running | done | error
+    in property <string> phase: "idle";
+    in property <int> done: 0;
+    in property <int> total: 0;
+    in property <string> message: "";
+    in property <string> confirm-text: "";
+    in property <string> translated-text: "";
+    in-out property <bool> show-translated: true;
+    callback start(int /* language index */);
+    callback confirm();
+    callback cancel();
+    callback close();
+}
+
+export component TranslationOverlay inherits Rectangle {
+    in property <bool> available: true;
+    // Floating entry button
+    if root.available && !TranslationBridge.open : Rectangle {
+        x: parent.width - self.width - 16px;
+        y: parent.height - self.height - 16px;
+        width: open-btn.preferred-width;
+        height: open-btn.preferred-height;
+        open-btn := Button { text: @tr("Translate"); clicked => { TranslationBridge.open = true; } }
+    }
+    if root.available && TranslationBridge.open : Rectangle {
+        x: 8px;
+        width: parent.width - 16px;
+        y: 8px;
+        height: parent.height - 16px;
+        // Translated view covers the original while the toggle is on.
+        if TranslationBridge.show-translated && TranslationBridge.translated-text != "" : Rectangle {
+            y: bar.height + 8px;
+            height: parent.height - bar.height - 8px;
+            background: AppTheme.surface;
+            border-radius: 8px;
+            border-width: 1px;
+            border-color: AppTheme.border-subtle;
+            ScrollView {
+                width: parent.width;
+                height: parent.height;
+                VerticalLayout {
+                    padding: 16px;
+                    Text { text: TranslationBridge.translated-text; wrap: word-wrap; color: AppTheme.body; font-size: TypeScale.body; }
+                }
+            }
+        }
+        bar := Rectangle {
+            y: 0;
+            height: row.preferred-height + 16px;
+            background: AppTheme.surface-raised;
+            border-radius: 8px;
+            border-width: 1px;
+            border-color: AppTheme.border;
+            row := HorizontalLayout {
+                padding: 8px;
+                spacing: 8px;
+                Text { text: @tr("Translate to"); vertical-alignment: center; color: AppTheme.body; }
+                lang := ComboBox { model: TranslationBridge.languages; current-index <=> TranslationBridge.language-index; width: 140px; enabled: TranslationBridge.phase != "running"; }
+                if TranslationBridge.phase != "running" && TranslationBridge.phase != "confirm" : Button { text: @tr("Translate"); primary: true; clicked => { TranslationBridge.start(lang.current-index); } }
+                if TranslationBridge.phase == "running" : Text {
+                    text: TranslationBridge.total > 0 ? @tr("Translating {} / {}", TranslationBridge.done, TranslationBridge.total) : @tr("Translating…");
+                    vertical-alignment: center; color: AppTheme.secondary;
+                }
+                if TranslationBridge.phase == "running" : Button { text: @tr("Cancel"); clicked => { TranslationBridge.cancel(); } }
+                if TranslationBridge.translated-text != "" : Button {
+                    text: TranslationBridge.show-translated ? @tr("Show original") : @tr("Show translation");
+                    clicked => { TranslationBridge.show-translated = !TranslationBridge.show-translated; }
+                }
+                Text { text: TranslationBridge.message; vertical-alignment: center; color: AppTheme.muted; horizontal-stretch: 1; overflow: elide; font-size: TypeScale.secondary; }
+                Button { text: @tr("Close"); clicked => { TranslationBridge.close(); } }
+            }
+        }
+        // Cost confirmation over the thresholds.
+        if TranslationBridge.phase == "confirm" : Rectangle {
+            y: bar.height + 8px;
+            height: dlg.preferred-height;
+            background: AppTheme.surface;
+            border-radius: 8px;
+            border-width: 1px;
+            border-color: AppTheme.accent;
+            dlg := VerticalLayout {
+                padding: 14px;
+                spacing: 10px;
+                Text { text: @tr("This is a long message"); font-weight: 600; color: AppTheme.heading; }
+                Text { text: TranslationBridge.confirm-text; wrap: word-wrap; color: AppTheme.body; }
+                HorizontalLayout {
+                    spacing: 8px;
+                    alignment: start;
+                    Button { text: @tr("Translate anyway"); primary: true; clicked => { TranslationBridge.confirm(); } }
+                    Button { text: @tr("Cancel"); clicked => { TranslationBridge.cancel(); } }
+                }
+            }
+        }
+    }
+}
