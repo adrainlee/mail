@@ -315,3 +315,266 @@ fn store_round_trip_and_lru_trim() {
             .is_empty()
     );
 }
+
+// ---- Siftmail M9: language detection, long-paragraph splitting, streaming,
+// mock OpenAI-compatible server end to end.
+
+#[test]
+fn detects_common_languages_and_targets() {
+    assert_eq!(
+        lang::detect("你好，这是一封关于下周会议安排的邮件，请查收。"),
+        Some("zh")
+    );
+    assert_eq!(
+        lang::detect("こんにちは、来週の会議についてのメールです。よろしくお願いします。"),
+        Some("ja")
+    );
+    assert_eq!(
+        lang::detect("안녕하세요, 다음 주 회의에 대한 이메일입니다."),
+        Some("ko")
+    );
+    assert_eq!(
+        lang::detect("Здравствуйте, это письмо о встрече на следующей неделе."),
+        Some("ru")
+    );
+    assert_eq!(
+        lang::detect("Hello, this is the agenda for the meeting and you are invited to join us."),
+        Some("en")
+    );
+    assert_eq!(
+        lang::detect(
+            "Bonjour, voici les documents pour la réunion et nous vous attendons dans la salle."
+        ),
+        Some("fr")
+    );
+    assert_eq!(lang::detect("ok 123"), None);
+    assert_eq!(lang::target_code("Chinese (Simplified)"), Some("zh"));
+    assert_eq!(lang::target_code("zh-CN"), Some("zh"));
+    assert_eq!(lang::target_code("English"), Some("en"));
+    assert_eq!(lang::target_code("日本語"), Some("ja"));
+    assert!(lang::already_in("这是一封中文邮件，不需要翻译。", "中文"));
+    assert!(!lang::already_in(
+        "This mail is written in English for you.",
+        "中文"
+    ));
+}
+
+#[test]
+fn split_keeps_text_and_inline_pairs_intact() {
+    let sentence = "This is a fairly ordinary sentence about the project timeline. ";
+    let mut src = sentence.repeat(60);
+    src.push_str("Read ⟦t1⟧the full. report. here⟦/t1⟧ please. ");
+    src.push_str(&sentence.repeat(60));
+    let parts = split::split_source(&src, 200);
+    assert!(parts.len() > 2, "{}", parts.len());
+    assert_eq!(parts.concat(), src);
+    for p in &parts {
+        assert_eq!(p.matches("⟦t1⟧").count(), p.matches("⟦/t1⟧").count(), "{p}");
+    }
+    assert_eq!(
+        split::split_source("short.", 200),
+        vec!["short.".to_string()]
+    );
+}
+
+#[tokio::test]
+async fn overlong_paragraph_is_split_translated_and_rejoined() {
+    let body = "The quarterly report shows steady growth in every region. ".repeat(150);
+    let html = format!("<p>{body}</p>");
+    let seg = segment_html(&html, &opts());
+    assert_eq!(seg.blocks.iter().filter(|b| b.translatable).count(), 1);
+    let f = fake("ok");
+    let cfg = TranslateConfig {
+        chunk_budget: 300,
+        ..Default::default()
+    };
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let ev = events.clone();
+    let r = run(
+        &seg,
+        &cfg,
+        f.clone(),
+        None,
+        Arc::new(AtomicBool::new(false)),
+        Some(Arc::new(move |e| ev.lock().unwrap().push(e))),
+    )
+    .await;
+    assert!(*f.calls.lock().unwrap() > 1);
+    let out = reassemble(&seg, &r.outputs);
+    assert!(out.failed.is_empty());
+    assert_eq!(out.output, format!("<p>{}</p>", body.to_uppercase()));
+    // One final Block event for the whole paragraph.
+    let blocks = events
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|e| matches!(e, TranslateEvent::Block { .. }))
+        .count();
+    assert_eq!(blocks, 1);
+}
+
+#[tokio::test]
+async fn text_already_in_target_language_is_not_sent() {
+    let seg = segment_html(
+        "<p>这是一封中文邮件，内容已经是中文了，不需要再翻译。</p>",
+        &opts(),
+    );
+    let est = estimate(&seg, &TranslateConfig::default());
+    assert!(est.already_in_target);
+    assert_eq!(est.source_lang.as_deref(), Some("zh"));
+    let f = fake("ok");
+    let r = run(
+        &seg,
+        &TranslateConfig::default(),
+        f.clone(),
+        None,
+        Arc::new(AtomicBool::new(false)),
+        None,
+    )
+    .await;
+    assert_eq!(*f.calls.lock().unwrap(), 0);
+    assert_eq!(reassemble(&seg, &r.outputs).output, seg_original(&seg));
+}
+
+fn seg_original(seg: &Segmented) -> String {
+    reassemble(seg, &HashMap::new()).output
+}
+
+#[test]
+fn partial_items_only_returns_complete_objects() {
+    let got = partial_items(r#"[{"i":1,"t":"A"},{"i":2,"t":"B"#);
+    assert_eq!(got.len(), 1);
+    assert_eq!(got[&1], "A");
+    assert!(partial_items("```json\n[").is_empty());
+}
+
+/// Minimal OpenAI-compatible server: streams the upper-cased items back as
+/// SSE `choices[0].delta.content` events, a few characters at a time.
+async fn mock_openai() -> (String, Arc<Mutex<Vec<String>>>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = l.local_addr().unwrap().port();
+    let seen: Arc<Mutex<Vec<String>>> = Default::default();
+    let seen2 = seen.clone();
+    tokio::spawn(async move {
+        while let Ok((mut s, _)) = l.accept().await {
+            let seen = seen2.clone();
+            tokio::spawn(async move {
+                let mut buf = Vec::new();
+                let mut tmp = [0u8; 8192];
+                let body = loop {
+                    let n = s.read(&mut tmp).await.unwrap();
+                    if n == 0 {
+                        return;
+                    }
+                    buf.extend_from_slice(&tmp[..n]);
+                    let text = String::from_utf8_lossy(&buf).to_string();
+                    if let Some(h) = text.find("\r\n\r\n") {
+                        let len: usize = text[..h]
+                            .lines()
+                            .find_map(|l| {
+                                let l = l.to_ascii_lowercase();
+                                l.strip_prefix("content-length:")
+                                    .map(|v| v.trim().parse().unwrap())
+                            })
+                            .unwrap_or(0);
+                        if buf.len() >= h + 4 + len {
+                            break String::from_utf8_lossy(&buf[h + 4..h + 4 + len]).to_string();
+                        }
+                    }
+                };
+                let req: serde_json::Value = serde_json::from_str(&body).unwrap();
+                seen.lock()
+                    .unwrap()
+                    .push(req["model"].as_str().unwrap_or("").to_string());
+                let items: Vec<serde_json::Value> =
+                    serde_json::from_str(req["messages"][1]["content"].as_str().unwrap()).unwrap();
+                let out: Vec<serde_json::Value> = items
+                    .iter()
+                    .map(|it| serde_json::json!({"i": it["i"], "t": upper(it["t"].as_str().unwrap())}))
+                    .collect();
+                let reply = serde_json::Value::Array(out).to_string();
+                let mut sse = String::new();
+                let chars: Vec<char> = reply.chars().collect();
+                for piece in chars.chunks(7) {
+                    let d: String = piece.iter().collect();
+                    sse.push_str(&format!(
+                        "data: {}\n\n",
+                        serde_json::json!({"choices":[{"delta":{"content": d}}]})
+                    ));
+                }
+                sse.push_str("data: [DONE]\n\n");
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    sse.len()
+                );
+                let _ = s.write_all(head.as_bytes()).await;
+                let _ = s.write_all(sse.as_bytes()).await;
+            });
+        }
+    });
+    (format!("http://127.0.0.1:{port}/v1"), seen)
+}
+
+#[tokio::test]
+async fn end_to_end_against_mock_openai_server_with_streaming() {
+    let (base_url, seen) = mock_openai().await;
+    let ai = crate::ai::AiConfig {
+        base_url,
+        model: "translate-model".into(),
+        api_key: String::new(),
+        language: None,
+        usage_sink: None,
+    };
+    let html = "<h1>Weekly update</h1><p>See <a href=\"https://x.test/r\">the report</a> now.</p>\
+                <ul><li>First item here</li><li>Second item here</li></ul>";
+    let seg = segment_html(html, &opts());
+    let cfg = TranslateConfig {
+        chunk_budget: 60,
+        ..Default::default()
+    };
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let ev = events.clone();
+    let r = run(
+        &seg,
+        &cfg,
+        Arc::new(ai),
+        None,
+        Arc::new(AtomicBool::new(false)),
+        Some(Arc::new(move |e| ev.lock().unwrap().push(e))),
+    )
+    .await;
+    assert!(r.errors.is_empty(), "{:?}", r.errors);
+    let out = reassemble(&seg, &r.outputs);
+    assert!(out.failed.is_empty(), "{:?}", out.failed);
+    assert!(
+        out.output.contains("<h1>WEEKLY UPDATE</h1>"),
+        "{}",
+        out.output
+    );
+    assert!(
+        out.output
+            .contains("<a href=\"https://x.test/r\">THE REPORT</a>"),
+        "{}",
+        out.output
+    );
+    assert!(
+        out.output.contains("<li>SECOND ITEM HERE</li>"),
+        "{}",
+        out.output
+    );
+    assert!(seen.lock().unwrap().iter().all(|m| m == "translate-model"));
+    let ev = events.lock().unwrap();
+    let previews = ev
+        .iter()
+        .filter(|e| matches!(e, TranslateEvent::Preview { .. }))
+        .count();
+    assert!(previews >= 1, "streaming previews expected");
+    let first_preview = ev
+        .iter()
+        .position(|e| matches!(e, TranslateEvent::Preview { .. }));
+    let first_block = ev
+        .iter()
+        .position(|e| matches!(e, TranslateEvent::Block { .. }));
+    assert!(first_preview < first_block);
+}

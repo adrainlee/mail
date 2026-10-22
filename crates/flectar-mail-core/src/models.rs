@@ -342,6 +342,10 @@ impl Default for AccountSettings {
     }
 }
 
+fn default_translate_target() -> String {
+    "Chinese (Simplified)".into()
+}
+
 const fn default_mail_history() -> MailHistory {
     MailHistory::SixMonths
 }
@@ -1524,6 +1528,15 @@ pub struct Settings {
     /// Which model tier the AI classifier uses: "instant" | "cheap" | "intelligent".
     #[serde(default = "default_tier_instant")]
     pub ai_tier_categorize: String,
+    /// Siftmail: tier for translating mail; `ai_model_translate`, when set,
+    /// names an exact model on the same endpoint instead.
+    #[serde(default = "default_tier_cheap")]
+    pub ai_tier_translate: String,
+    #[serde(default)]
+    pub ai_model_translate: String,
+    /// Default target language for the translation bar.
+    #[serde(default = "default_translate_target")]
+    pub translate_target_lang: String,
     /// Group the thread list under date headers (Today / Yesterday / …).
     #[serde(default = "default_true")]
     pub group_by_date: bool,
@@ -1745,6 +1758,9 @@ impl Default for Settings {
             ai_category_prompt: String::new(),
             ai_automation_rules: Vec::new(),
             ai_tier_categorize: default_tier_instant(),
+            ai_tier_translate: default_tier_cheap(),
+            ai_model_translate: String::new(),
+            translate_target_lang: default_translate_target(),
             group_by_date: true,
             contact_suggest_all_accounts: false,
             collect_outgoing_contacts: true,

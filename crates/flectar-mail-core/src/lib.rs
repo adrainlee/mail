@@ -276,6 +276,8 @@ enum Scenario {
     QuickReply,
     /// Sorting incoming mail into categories at sync (short prompt, per-email).
     Categorize,
+    /// Siftmail: translating long mail (own model setting).
+    Translate,
 }
 
 impl Scenario {
@@ -288,6 +290,7 @@ impl Scenario {
             Scenario::Command => "command",
             Scenario::QuickReply => "quick_reply",
             Scenario::Categorize => "automation",
+            Scenario::Translate => "translate",
         }
     }
 }
@@ -300,6 +303,10 @@ fn resolve_ai_model(settings: &Settings, scenario: Scenario) -> String {
         Scenario::Summarize => settings.ai_tier_summarize.as_str(),
         Scenario::Voice => settings.ai_tier_voice.as_str(),
         Scenario::Categorize => settings.ai_tier_categorize.as_str(),
+        Scenario::Translate if !settings.ai_model_translate.trim().is_empty() => {
+            return settings.ai_model_translate.trim().to_string();
+        }
+        Scenario::Translate => settings.ai_tier_translate.as_str(),
         // Palette parsing and reply chips want the fastest model available.
         Scenario::Command | Scenario::QuickReply => "instant",
     };
