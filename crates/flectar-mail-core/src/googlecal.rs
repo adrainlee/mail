@@ -15,7 +15,7 @@ const MAX_CALENDAR_LIST_PAGES: usize = 100;
 const MAX_CALENDARS: usize = 10_000;
 const MAX_PAGE_TOKEN_BYTES: usize = 16 * 1024;
 
-fn calendar_http_client() -> Result<&'static reqwest::Client> {
+fn calendar_http_client_shared() -> Result<&'static reqwest::Client> {
     static HTTP: once_cell::sync::Lazy<std::result::Result<reqwest::Client, String>> =
         once_cell::sync::Lazy::new(|| {
             reqwest::Client::builder()
@@ -28,6 +28,23 @@ fn calendar_http_client() -> Result<&'static reqwest::Client> {
         });
     HTTP.as_ref()
         .map_err(|message| CoreError::Network(message.clone()))
+}
+
+/// Siftmail: the shared client, or a proxied one when the calling account
+/// (see [`crate::net::proxy::ACCOUNT_SCOPE`]) has a proxy.
+fn calendar_http_client() -> Result<std::borrow::Cow<'static, reqwest::Client>> {
+    let Some(p) = crate::net::proxy::scoped_proxy() else {
+        return calendar_http_client_shared().map(std::borrow::Cow::Borrowed);
+    };
+    let builder = reqwest::Client::builder()
+        .user_agent("flectar-mail-google-calendar/0.1")
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(30))
+        .redirect(reqwest::redirect::Policy::none());
+    crate::net::proxy::with_proxy(builder, Some(&p))?
+        .build()
+        .map(std::borrow::Cow::Owned)
+        .map_err(|e| CoreError::Network(format!("proxied HTTP client: {e}")))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

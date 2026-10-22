@@ -8,7 +8,6 @@ use crate::oauth::providers::for_provider;
 use crate::oauth::redirect::{
     LoopbackRedirectBroker, OAUTH_REDIRECT_TIMEOUT, OAuthRedirectBrokerHandle,
 };
-use crate::oauth::tokens::post_form;
 use base64::Engine;
 use sha2::Digest;
 
@@ -201,9 +200,14 @@ pub async fn authorize_with_broker(
         form.push(("scope".to_string(), cfg.scopes.join(" ")));
     }
 
-    let body = post_form(cfg.token_url, &form).await.inspect_err(
-        |e| tracing::warn!(?provider, error = %e, "oauth: token endpoint unreachable"),
-    )?;
+    // Siftmail: sign-in leaves through the global proxy when one is set.
+    let body = crate::oauth::tokens::post_form_via(
+        cfg.token_url,
+        &form,
+        crate::net::proxy::global_proxy().as_ref(),
+    )
+    .await
+    .inspect_err(|e| tracing::warn!(?provider, error = %e, "oauth: token endpoint unreachable"))?;
     let tok: ExchangeResponse = serde_json::from_str(&body).map_err(|_| {
         let detail = crate::http_body::single_line_excerpt(&body, 512);
         tracing::warn!(?provider, response = %detail, "oauth: token exchange rejected");
@@ -285,9 +289,24 @@ async fn google_identity_from_access_token(access_token: &str) -> Result<OAuthId
                 .build()
                 .map_err(|error| format!("Google identity HTTP client: {error}"))
         });
-    let http = HTTP
-        .as_ref()
-        .map_err(|message| CoreError::Network(message.clone()))?;
+    let proxied;
+    let http = match crate::net::proxy::global_proxy() {
+        Some(p) => {
+            proxied = crate::net::proxy::with_proxy(
+                reqwest::Client::builder()
+                    .connect_timeout(std::time::Duration::from_secs(10))
+                    .timeout(std::time::Duration::from_secs(30))
+                    .redirect(reqwest::redirect::Policy::none()),
+                Some(&p),
+            )?
+            .build()
+            .map_err(|e| CoreError::Network(format!("Google identity HTTP client: {e}")))?;
+            &proxied
+        }
+        None => HTTP
+            .as_ref()
+            .map_err(|message| CoreError::Network(message.clone()))?,
+    };
     let response = http
         .get("https://openidconnect.googleapis.com/v1/userinfo")
         .bearer_auth(access_token)

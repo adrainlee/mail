@@ -174,6 +174,77 @@ pub fn account_proxy(account_id: i64) -> Option<ProxyConfig> {
         .cloned()
 }
 
+static GLOBAL_PROXY: std::sync::RwLock<Option<ProxyConfig>> = std::sync::RwLock::new(None);
+
+/// Remember the current global proxy (with its password) so sign-in paths
+/// that run before an account exists use the same egress.
+pub fn remember_global_proxy(proxy: Option<ProxyConfig>) {
+    *GLOBAL_PROXY
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = proxy;
+}
+
+pub fn global_proxy() -> Option<ProxyConfig> {
+    GLOBAL_PROXY
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+}
+
+/// Re-read the global proxy from SQLite into [`global_proxy`].
+pub fn refresh_global_proxy(conn: &Connection) -> Result<()> {
+    let p = match global_proxy_id(conn)? {
+        Some(id) => get(conn, id)?.map(|mut p| {
+            p.password = cached_password(p.id);
+            p
+        }),
+        None => None,
+    };
+    remember_global_proxy(p);
+    Ok(())
+}
+
+tokio::task_local! {
+    /// Account whose egress HTTP helpers without an account parameter
+    /// (Microsoft Graph, Google Calendar) should use.
+    pub static ACCOUNT_SCOPE: i64;
+}
+
+/// Proxy of the account in [`ACCOUNT_SCOPE`]; outside any account scope
+/// (sign-in / account setup) the global proxy.
+pub fn scoped_proxy() -> Option<ProxyConfig> {
+    match ACCOUNT_SCOPE.try_with(|id| account_proxy(*id)) {
+        Ok(p) => p,
+        Err(_) => global_proxy(),
+    }
+}
+
+/// Apply an optional proxy to a reqwest builder.
+pub fn with_proxy(
+    builder: reqwest::ClientBuilder,
+    proxy: Option<&ProxyConfig>,
+) -> Result<reqwest::ClientBuilder> {
+    Ok(match proxy {
+        Some(p) => builder.proxy(reqwest_proxy(p)?),
+        None => builder,
+    })
+}
+
+/// `host:port` an account actually talks to, for a meaningful proxy test.
+pub fn account_endpoint(config: &crate::models::AccountConfig) -> (String, u16) {
+    use crate::models::{MailProtocol, Provider};
+    if config.provider == Provider::Gmail {
+        return ("gmail.googleapis.com".into(), 443);
+    }
+    if config.mail_protocol == MailProtocol::Jmap
+        && let Ok(u) = reqwest::Url::parse(&config.jmap_url)
+        && let Some(h) = u.host_str()
+    {
+        return (h.to_owned(), u.port_or_known_default().unwrap_or(443));
+    }
+    (config.imap_host.clone(), config.imap_port)
+}
+
 /// Proxy URL for reqwest (`socks5h` keeps DNS on the proxy).
 pub fn reqwest_proxy(p: &ProxyConfig) -> Result<reqwest::Proxy> {
     let scheme = match (p.kind, p.remote_dns) {
