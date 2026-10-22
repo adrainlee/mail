@@ -622,6 +622,159 @@ fn register_proxies(ctx: &Ctx, bridge: &SiftmailBridge) {
     });
 }
 
+// ---- embeddings -------------------------------------------------------
+
+use flectar_mail_core::embed::providers::{EmbeddingConfig, ProviderKind};
+
+pub(super) fn embedding_kind_at(index: i32) -> ProviderKind {
+    match index {
+        1 => ProviderKind::OpenAi,
+        2 => ProviderKind::Local,
+        _ => ProviderKind::Ollama,
+    }
+}
+
+pub(super) fn embedding_kind_index(kind: ProviderKind) -> i32 {
+    match kind {
+        ProviderKind::Ollama => 0,
+        ProviderKind::OpenAi => 1,
+        ProviderKind::Local => 2,
+    }
+}
+
+pub(super) fn embedding_form(kind: i32, url: &str, model: &str) -> EmbeddingConfig {
+    let kind = embedding_kind_at(kind);
+    let url = url.trim();
+    EmbeddingConfig {
+        kind,
+        base_url: match (kind, url.is_empty()) {
+            (ProviderKind::Ollama, true) => {
+                flectar_mail_core::embed::providers::DEFAULT_OLLAMA_URL.into()
+            }
+            _ => url.trim_end_matches('/').to_string(),
+        },
+        model: model.trim().to_string(),
+        // 0 = probe the dimension on save/test.
+        dim: 0,
+        ..EmbeddingConfig::default()
+    }
+}
+
+pub(super) fn rebuild_text(check: &flectar_mail_core::EmbeddingCheck) -> Option<String> {
+    (check.stale_vectors > 0).then(|| {
+        format!(
+            "The embedding model is now {} ({} dimensions){}. {} stored vectors were made with another model and cannot be mixed with the new ones. Rebuild removes them so mail is re-indexed with the new model.",
+            check.model_id,
+            check.dim,
+            check
+                .previous_model_id
+                .as_ref()
+                .map(|p| format!(", previously {p}"))
+                .unwrap_or_default(),
+            check.stale_vectors
+        )
+    })
+}
+
+fn refresh_embedding(ctx: &Ctx) {
+    ctx.spawn(
+        |core| async move { core.embedding_config().await.map_err(|e| e.to_string()) },
+        |app, (cfg, has_key)| {
+            let b = app.global::<SiftmailBridge>();
+            b.set_embedding_kind_index(embedding_kind_index(cfg.kind));
+            b.set_embedding_url(cfg.base_url.into());
+            b.set_embedding_model(cfg.model.into());
+            b.set_embedding_has_key(has_key);
+        },
+    );
+}
+
+fn set_embedding_result(ctx: &Ctx, text: String) {
+    if let Some(app) = ctx.app.upgrade() {
+        app.global::<SiftmailBridge>()
+            .set_embedding_result(text.into());
+    }
+}
+
+fn register_embedding(ctx: &Ctx, bridge: &SiftmailBridge) {
+    let c = ctx.clone();
+    bridge.on_refresh_embedding(move || refresh_embedding(&c));
+
+    let c = ctx.clone();
+    bridge.on_test_embedding(move |kind, url, model, key| {
+        let cfg = embedding_form(kind, &url, &model);
+        let key = Some(key.to_string()).filter(|k| !k.is_empty());
+        set_embedding_result(&c, "Testing…".into());
+        let report = c.clone();
+        c.spawn(
+            move |core| async move {
+                Ok(core.test_embedding(cfg, key).await.map_err(|e| e.to_string()))
+            },
+            move |_, r| {
+                set_embedding_result(
+                    &report,
+                    match r {
+                        Ok(ch) => format!(
+                            "OK: {} · {} dimensions · {} ms",
+                            ch.model_id, ch.dim, ch.latency_ms
+                        ),
+                        Err(e) => format!("Failed: {e}"),
+                    },
+                )
+            },
+        );
+    });
+
+    let c = ctx.clone();
+    bridge.on_save_embedding(move |kind, url, model, key, changed| {
+        let cfg = embedding_form(kind, &url, &model);
+        let key = changed.then(|| key.to_string());
+        set_embedding_result(&c, "Checking and saving…".into());
+        let report = c.clone();
+        c.spawn(
+            move |core| async move {
+                Ok(core
+                    .save_embedding_config(cfg, key)
+                    .await
+                    .map_err(|e| e.to_string()))
+            },
+            move |app, r| {
+                let b = app.global::<SiftmailBridge>();
+                match r {
+                    Ok(ch) => {
+                        set_embedding_result(
+                            &report,
+                            format!("Saved: {} · {} dimensions", ch.model_id, ch.dim),
+                        );
+                        if let Some(text) = rebuild_text(&ch) {
+                            b.set_embedding_rebuild_text(text.into());
+                            b.set_embedding_rebuild_prompt(true);
+                        }
+                        refresh_embedding(&report);
+                    }
+                    Err(e) => set_embedding_result(&report, format!("Not saved: {e}")),
+                }
+            },
+        );
+    });
+
+    let c = ctx.clone();
+    bridge.on_rebuild_embedding_index(move || {
+        let report = c.clone();
+        c.spawn(
+            |core| async move { core.rebuild_embedding_index().await.map_err(|e| e.to_string()) },
+            move |app, n| {
+                app.global::<SiftmailBridge>()
+                    .set_embedding_rebuild_prompt(false);
+                set_embedding_result(
+                    &report,
+                    format!("Removed {n} old vectors; mail will be re-indexed."),
+                );
+            },
+        );
+    });
+}
+
 pub(super) fn register(
     app: &AppWindow,
     state: &Rc<RefCell<InboxState>>,
@@ -651,6 +804,7 @@ pub(super) fn register(
     });
     register_categories(&ctx, &bridge);
     register_proxies(&ctx, &bridge);
+    register_embedding(&ctx, &bridge);
 }
 
 #[cfg(test)]
@@ -659,6 +813,30 @@ mod tests {
     fn remaining_is_rounded_up_to_minutes() {
         assert_eq!(super::format_remaining(1), "1 min");
         assert_eq!(super::format_remaining(90 * 60_000), "1 h 30 min");
+    }
+
+    #[test]
+    fn embedding_form_defaults_and_rebuild_prompt() {
+        use flectar_mail_core::embed::providers::ProviderKind;
+        let c = super::embedding_form(0, " ", "bge-m3");
+        assert_eq!(c.kind, ProviderKind::Ollama);
+        assert_eq!(c.base_url, "http://127.0.0.1:11434");
+        let c = super::embedding_form(1, "https://x.test/v1/", "m");
+        assert_eq!((c.kind, c.base_url.as_str()), (ProviderKind::OpenAi, "https://x.test/v1"));
+        for i in 0..3 {
+            assert_eq!(super::embedding_kind_index(super::embedding_kind_at(i)), i);
+        }
+        let mut check = flectar_mail_core::EmbeddingCheck {
+            model_id: "ollama:bge-m3:1024".into(),
+            dim: 1024,
+            latency_ms: 3,
+            previous_model_id: Some("local:x:384".into()),
+            stale_vectors: 0,
+        };
+        assert!(super::rebuild_text(&check).is_none());
+        check.stale_vectors = 12;
+        let t = super::rebuild_text(&check).unwrap();
+        assert!(t.contains("12") && t.contains("local:x:384"));
     }
 
     #[test]
