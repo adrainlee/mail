@@ -392,6 +392,7 @@ pub struct Core {
         Arc<tokio::sync::Mutex<HashMap<i64, std::sync::Weak<tokio::sync::Mutex<()>>>>>,
     #[cfg(feature = "local-embeddings")]
     embed: Arc<embed::EmbedState>,
+    remote_embed: Arc<embed::remote::RemoteState>,
     /// Fired by `cancel_oauth` to abort a pending browser sign-in (the
     /// loopback wait otherwise blocks the UI until its 15-minute timeout).
     oauth_cancel: Arc<tokio::sync::Notify>,
@@ -495,6 +496,7 @@ impl Core {
             attachment_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             #[cfg(feature = "local-embeddings")]
             embed: Arc::new(embed::EmbedState::new()),
+            remote_embed: Arc::new(embed::remote::RemoteState::default()),
             oauth_cancel: Arc::new(tokio::sync::Notify::new()),
             ui_ready: Arc::new(tokio::sync::Notify::new()),
             ai_router_lock: Arc::new(tokio::sync::Mutex::new(())),
@@ -673,8 +675,15 @@ impl Core {
             core.provision_bundled_model().await;
             embed::worker::spawn(core.db.clone(), core.embed.clone(), core.paths.clone());
         }
-        #[cfg(not(feature = "local-embeddings"))]
-        let _ = enable_embeddings;
+        // Siftmail: remote (Ollama / OpenAI-compatible) indexing, available
+        // without the local model runtime.
+        if enable_embeddings {
+            embed::remote::spawn(
+                core.db.clone(),
+                core.remote_embed.clone(),
+                core.credentials.clone(),
+            );
+        }
 
         // One-shot routing backfill: on a fresh 007 install or an upgrade to the
         // 014 routing column, resolve every existing thread's tab once. Guarded

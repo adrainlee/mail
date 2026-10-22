@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 pub mod providers;
+pub mod remote;
 pub mod store;
 #[cfg(feature = "local-embeddings")]
 pub mod worker;
@@ -449,15 +450,12 @@ impl Embedder for LocalCandle {
 
 /// Roughly how many characters map to one token - used for approximate chunk
 /// sizing (the tokenizer still truncates each chunk exactly).
-#[cfg(feature = "local-embeddings")]
 const CHARS_PER_TOKEN: usize = 4;
-#[cfg(feature = "local-embeddings")]
 const MAX_CHUNKS: usize = 6;
 
 /// Turn a message subject + plaintext body into passage chunks ready to embed.
 /// Strips quoted reply history and signatures, prepends the subject to the
 /// first chunk, and splits long bodies into overlapping windows.
-#[cfg(feature = "local-embeddings")]
 pub fn prepare_chunks(subject: &str, body: &str, max_tokens: usize) -> Vec<String> {
     let cleaned = clean_body(body);
     let subject = subject.trim();
@@ -501,7 +499,6 @@ pub fn prepare_chunks(subject: &str, body: &str, max_tokens: usize) -> Vec<Strin
 
 /// Remove quoted reply history and trailing signatures from plaintext so we
 /// embed original content, not repeated quotes.
-#[cfg(feature = "local-embeddings")]
 fn clean_body(body: &str) -> String {
     let mut out: Vec<&str> = Vec::new();
     for line in body.lines() {

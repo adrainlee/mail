@@ -678,13 +678,20 @@ pub(super) fn rebuild_text(check: &flectar_mail_core::EmbeddingCheck) -> Option<
 
 fn refresh_embedding(ctx: &Ctx) {
     ctx.spawn(
-        |core| async move { core.embedding_config().await.map_err(|e| e.to_string()) },
-        |app, (cfg, has_key)| {
+        |core| async move {
+            let notice = core.embedding_notice().await.unwrap_or_default();
+            core.embedding_config()
+                .await
+                .map(|(c, k)| (c, k, notice))
+                .map_err(|e| e.to_string())
+        },
+        |app, (cfg, has_key, notice)| {
             let b = app.global::<SiftmailBridge>();
             b.set_embedding_kind_index(embedding_kind_index(cfg.kind));
             b.set_embedding_url(cfg.base_url.into());
             b.set_embedding_model(cfg.model.into());
             b.set_embedding_has_key(has_key);
+            b.set_embedding_notice(notice.into());
         },
     );
 }

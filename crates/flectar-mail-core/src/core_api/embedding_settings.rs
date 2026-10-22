@@ -72,6 +72,22 @@ impl Core {
         Ok((cfg, has_key))
     }
 
+    /// User-facing notice when the configured remote embedding service is
+    /// unavailable. Search keeps working: semantic hits come back empty and
+    /// keyword (FTS) results are shown on their own, or the bundled local
+    /// model takes over in builds that ship it.
+    pub async fn embedding_notice(&self) -> Option<String> {
+        let err = self.remote_embed.last_error.read().await.clone()?;
+        let fallback = if cfg!(feature = "local-embeddings") {
+            "the local model is indexing instead"
+        } else {
+            "search uses keywords only until it is reachable again"
+        };
+        Some(format!(
+            "Embedding service unavailable ({err}); {fallback}."
+        ))
+    }
+
     async fn with_key(&self, mut cfg: EmbeddingConfig, key: Option<String>) -> EmbeddingConfig {
         cfg.api_key = match key {
             Some(k) if !k.is_empty() => Some(k),

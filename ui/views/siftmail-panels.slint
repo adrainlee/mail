@@ -74,6 +74,7 @@ export global SiftmailBridge {
     in-out property <string> embedding-model: "";
     in property <bool> embedding-has-key: false;
     in property <string> embedding-result: "";
+    in property <string> embedding-notice: "";
     // Shown after a save changed the model/dimension and old vectors exist.
     in-out property <bool> embedding-rebuild-prompt: false;
     in property <string> embedding-rebuild-text: "";
@@ -316,6 +317,7 @@ export component EmbeddingPanel inherits VerticalLayout {
             Button { text: @tr("Test connection"); enabled: kind.current-index != 2; clicked => { SiftmailBridge.test-embedding(kind.current-index, url.text, model.text, key.text); } }
             Button { text: @tr("Save"); primary: true; clicked => { SiftmailBridge.save-embedding(kind.current-index, url.text, model.text, key.text, key.text != ""); key.text = ""; } }
         }
+        if SiftmailBridge.embedding-notice != "" : Text { text: "⚠ " + SiftmailBridge.embedding-notice; color: #c0392b; wrap: word-wrap; }
         if SiftmailBridge.embedding-result != "" : Text { text: SiftmailBridge.embedding-result; color: AppTheme.secondary; wrap: word-wrap; }
     }
     if SiftmailBridge.embedding-rebuild-prompt : Rectangle {
