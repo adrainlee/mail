@@ -20,6 +20,9 @@ export struct CategoryItem { id: string, name: string, description: string }
 export struct RuleItem { id: int, category-index: int, category-name: string, name: string, field-index: int, op-index: int, value: string, summary: string, editable: bool, enabled: bool }
 export struct SuggestionItem { id: int, title: string, category-index: int, category-name: string, confidence: string, rationale: string }
 
+export struct ProxyItem { id: int, name: string, kind-index: int, host: string, port: string, username: string, has-password: bool }
+export struct AccountProxyItem { account-id: int, email: string, mode-index: int, proxy-index: int }
+
 export global SiftmailBridge {
     // Sub-page inside the Siftmail settings tab.
     in-out property <string> page: "scheduler";
@@ -48,6 +51,21 @@ export global SiftmailBridge {
     // Accept applies only the category the user picked in the row.
     callback accept-suggestion(int /* id */, int /* chosen category index */);
     callback reject-suggestion(int);
+
+    // Proxies (passwords go to the OS credential store, never shown back)
+    in property <[ProxyItem]> proxies: [];
+    in property <[string]> proxy-names: [];
+    in property <int> global-proxy-index: 0; // 0 = none, n = proxies[n-1]
+    in property <[AccountProxyItem]> account-proxies: [];
+    out property <[string]> proxy-kinds: ["SOCKS5", "HTTP CONNECT"];
+    out property <[string]> proxy-modes: [@tr("Direct"), @tr("Global default"), @tr("Custom")];
+    in-out property <string> proxy-test-result: "";
+    callback refresh-proxies();
+    callback save-proxy(int /* id, 0 = new */, string /* name */, int /* kind */, string /* host */, string /* port */, string /* username */, string /* password */, bool /* password changed */);
+    callback delete-proxy(int);
+    callback set-global-proxy(int /* index into proxy-names with 0 = none */);
+    callback set-account-proxy(int /* account id */, int /* mode */, int /* proxy index */);
+    callback test-proxy(int /* proxy id */, string /* host */, string /* port */);
 }
 
 component SubTab inherits Rectangle {
@@ -66,6 +84,7 @@ export component SiftmailSubTabs inherits HorizontalLayout {
     spacing: 6px;
     alignment: start;
     SubTab { text: @tr("Categories"); selected: SiftmailBridge.page == "categories"; clicked => { SiftmailBridge.page = "categories"; SiftmailBridge.refresh-categories(); } }
+    SubTab { text: @tr("Proxies"); selected: SiftmailBridge.page == "proxies"; clicked => { SiftmailBridge.page = "proxies"; SiftmailBridge.refresh-proxies(); } }
     SubTab { text: @tr("Sync scheduler"); selected: SiftmailBridge.page == "scheduler"; clicked => { SiftmailBridge.page = "scheduler"; SiftmailBridge.refresh-scheduler(); } }
 }
 
@@ -194,10 +213,67 @@ export component CategoriesPanel inherits VerticalLayout {
     }
 }
 
+export component ProxiesPanel inherits VerticalLayout {
+    spacing: 12px;
+    Card {
+        SectionTitle { text: @tr("Shared proxies"); }
+        Text { text: @tr("IMAP, SMTP and OAuth token refresh connect through the chosen proxy; TLS stays end to end. Passwords are kept in Windows Credential Manager, not in the database."); wrap: word-wrap; color: AppTheme.secondary; font-size: TypeScale.secondary; }
+        for p in SiftmailBridge.proxies : VerticalLayout {
+            spacing: 4px;
+            HorizontalLayout {
+                spacing: 6px;
+                pname := LineEdit { text: p.name; width: 110px; input-label: @tr("Name"); }
+                pkind := ComboBox { model: SiftmailBridge.proxy-kinds; current-index: p.kind-index; width: 130px; }
+                phost := LineEdit { text: p.host; horizontal-stretch: 1; input-label: @tr("Host"); }
+                pport := LineEdit { text: p.port; width: 70px; input-label: @tr("Port"); }
+                puser := LineEdit { text: p.username; width: 110px; placeholder-text: @tr("Username"); input-label: @tr("Username"); }
+                ppass := LineEdit { input-type: password; width: 110px; placeholder-text: p.has-password ? "••••••" : @tr("Password"); input-label: @tr("Password"); }
+            }
+            HorizontalLayout {
+                spacing: 6px;
+                alignment: end;
+                Button { text: @tr("Save"); clicked => { SiftmailBridge.save-proxy(p.id, pname.text, pkind.current-index, phost.text, pport.text, puser.text, ppass.text, ppass.text != ""); ppass.text = ""; } }
+                Button { text: @tr("Test"); clicked => { SiftmailBridge.test-proxy(p.id, "imap.gmail.com", "993"); } }
+                Button { text: @tr("Delete"); destructive: true; clicked => { SiftmailBridge.delete-proxy(p.id); } }
+            }
+        }
+        HorizontalLayout {
+            spacing: 6px;
+            nname := LineEdit { placeholder-text: @tr("Name"); width: 110px; input-label: @tr("Name"); }
+            nkind := ComboBox { model: SiftmailBridge.proxy-kinds; current-index: 0; width: 130px; }
+            nhost := LineEdit { placeholder-text: "192.168.1.10"; horizontal-stretch: 1; input-label: @tr("Host"); }
+            nport := LineEdit { placeholder-text: "1080"; width: 70px; input-label: @tr("Port"); }
+            nuser := LineEdit { placeholder-text: @tr("Username"); width: 110px; input-label: @tr("Username"); }
+            npass := LineEdit { input-type: password; placeholder-text: @tr("Password"); width: 110px; input-label: @tr("Password"); }
+            Button { text: @tr("Add"); primary: true; enabled: nhost.text != "" && nport.text != ""; clicked => { SiftmailBridge.save-proxy(0, nname.text, nkind.current-index, nhost.text, nport.text, nuser.text, npass.text, npass.text != ""); nhost.text = ""; npass.text = ""; } }
+        }
+        if SiftmailBridge.proxy-test-result != "" : Text { text: SiftmailBridge.proxy-test-result; color: AppTheme.secondary; wrap: word-wrap; }
+    }
+    Card {
+        SectionTitle { text: @tr("Global default proxy"); }
+        HorizontalLayout {
+            spacing: 8px;
+            Text { text: @tr("Accounts set to “Global default” use:"); vertical-alignment: center; color: AppTheme.body; }
+            ComboBox { model: SiftmailBridge.proxy-names; current-index: SiftmailBridge.global-proxy-index; width: 200px; selected => { SiftmailBridge.set-global-proxy(self.current-index); } }
+        }
+    }
+    Card {
+        SectionTitle { text: @tr("Per-account proxy"); }
+        for a in SiftmailBridge.account-proxies : HorizontalLayout {
+            spacing: 8px;
+            Text { text: a.email; horizontal-stretch: 1; vertical-alignment: center; color: AppTheme.body; overflow: elide; }
+            amode := ComboBox { model: SiftmailBridge.proxy-modes; current-index: a.mode-index; width: 150px; selected => { if self.current-index != 2 { SiftmailBridge.set-account-proxy(a.account-id, self.current-index, 0); } } }
+            aproxy := ComboBox { model: SiftmailBridge.proxy-names; current-index: a.proxy-index; width: 180px; enabled: amode.current-index == 2; selected => { SiftmailBridge.set-account-proxy(a.account-id, 2, self.current-index); } }
+        }
+        Text { text: @tr("Changes apply on the account's next connection."); color: AppTheme.muted; font-size: TypeScale.secondary; }
+    }
+}
+
 export component SiftmailPage inherits VerticalLayout {
     spacing: 12px;
     SiftmailSubTabs { }
     if SiftmailBridge.status != "" : Text { text: SiftmailBridge.status; color: AppTheme.secondary; wrap: word-wrap; }
     if SiftmailBridge.page == "scheduler" : SchedulerPanel { }
     if SiftmailBridge.page == "categories" : CategoriesPanel { }
+    if SiftmailBridge.page == "proxies" : ProxiesPanel { }
 }
