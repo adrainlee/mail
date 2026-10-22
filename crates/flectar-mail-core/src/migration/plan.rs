@@ -505,6 +505,7 @@ fn password_mapping(
             imap_security: imap_security?,
             smtp_security: smtp_security?,
             trusted_certificate_pem: String::new(),
+            ..Default::default()
         },
     })
 }

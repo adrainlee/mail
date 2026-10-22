@@ -40,6 +40,7 @@ fn settings_with_certificate(
         imap_security: mode,
         smtp_security: mode,
         trusted_certificate_pem: certificate.into(),
+        ..Default::default()
     }
 }
 async fn line<S: tokio::io::AsyncRead + Unpin>(stream: &mut BufReader<S>) -> String {

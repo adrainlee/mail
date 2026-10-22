@@ -227,6 +227,11 @@ pub struct MailConnectionSettings {
     /// Additional trust anchors for this account only; normal hostname and
     /// validity checks still apply. Contains public certificates, never keys.
     pub trusted_certificate_pem: String,
+    /// Siftmail M5: shared proxy (`proxies.id`) for IMAP/SMTP; `None` = direct.
+    pub proxy_id: Option<i64>,
+    /// Resolved from `proxy_id` when the account config is loaded.
+    #[serde(skip)]
+    pub proxy: Option<crate::net::proxy::ProxyConfig>,
 }
 
 /// Who files a copy after an SMTP submission. API transports own their filing.

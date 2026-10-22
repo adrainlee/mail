@@ -69,7 +69,17 @@ pub fn list_configs(conn: &Connection) -> Result<Vec<AccountConfig>> {
     let rows = stmt
         .query_map(params![CREDENTIAL_SETUP_STATE], config_from_row)?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok(rows)
+    rows.into_iter().map(|c| resolve_proxy(conn, c)).collect()
+}
+
+/// Siftmail M5: attach the referenced proxy so every connection path (sync,
+/// folder ops, SMTP) uses the same egress.
+fn resolve_proxy(conn: &Connection, mut config: AccountConfig) -> Result<AccountConfig> {
+    config.settings.connection.proxy = match config.settings.connection.proxy_id {
+        Some(id) => crate::net::proxy::get(conn, id)?,
+        None => None,
+    };
+    Ok(config)
 }
 
 pub fn get_config(conn: &Connection, id: i64) -> Result<Option<AccountConfig>> {
@@ -79,7 +89,10 @@ pub fn get_config(conn: &Connection, id: i64) -> Result<Option<AccountConfig>> {
                 imap_port, smtp_host, smtp_port, settings_json
          FROM accounts WHERE id = ?1",
     )?;
-    Ok(stmt.query_row(params![id], config_from_row).optional()?)
+    stmt.query_row(params![id], config_from_row)
+        .optional()?
+        .map(|c| resolve_proxy(conn, c))
+        .transpose()
 }
 
 pub fn get(conn: &Connection, id: i64) -> Result<Option<Account>> {

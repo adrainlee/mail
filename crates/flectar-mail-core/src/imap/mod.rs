@@ -354,9 +354,13 @@ async fn connect_inner(
 ) -> Result<Session> {
     use crate::models::ConnectionSecurity;
     let connector = account_tls_connector(&settings.trusted_certificate_pem)?;
-    let tcp = TcpStream::connect((host, port))
+    let tcp = crate::net::proxy::connect_tcp(host, port, settings.proxy.as_ref())
         .await
-        .map_err(|e| CoreError::Imap(format!("connect {host}:{port}: {e}")))?;
+        .map_err(|e| match e {
+            // Keep proxy failures recognizable for the scheduler.
+            e if crate::net::proxy::is_proxy_error(&e) => e,
+            e => CoreError::Imap(format!("connect {host}:{port}: {e}")),
+        })?;
     tcp.set_nodelay(true).ok();
     let starttls = match settings.imap_security {
         ConnectionSecurity::Starttls => true,

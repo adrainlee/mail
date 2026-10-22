@@ -26,6 +26,7 @@ pub mod mail_security;
 pub mod migration;
 pub mod mime;
 pub mod models;
+pub mod net;
 pub mod oauth;
 pub mod queue;
 pub mod route;
