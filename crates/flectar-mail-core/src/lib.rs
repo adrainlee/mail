@@ -33,6 +33,7 @@ pub mod search;
 pub mod sender_identities;
 pub mod signatures;
 pub mod smtp;
+pub mod suggest;
 pub mod sync;
 pub mod unsubscribe;
 
@@ -6703,8 +6704,9 @@ impl Core {
 
     /// Classify up to `limit` pending threads. With no custom automations this
     /// preserves the low-cost sender-domain category cache. Compound rules are
-    /// evaluated per message (their conditions may depend on subject/body), and
-    /// only their preconfigured action allow-lists are executed.
+    /// evaluated per message (their conditions may depend on subject/body).
+    /// Siftmail: matched rules are recorded as pending suggestions only; their
+    /// configured actions are never executed from AI output.
     pub async fn classify_pending(&self, limit: i64) -> Result<i64> {
         let _guard = self.ai_router_lock.lock().await;
         let settings = self.db.read(|conn| repo::settings::get(conn)).await?;
@@ -6734,12 +6736,17 @@ impl Core {
         let rules: Vec<AiAutomationRule> = settings
             .ai_automation_rules
             .iter()
-            .filter(|rule| rule.enabled && !rule.actions.is_empty())
+            .filter(|rule| rule.enabled)
             .cloned()
             .collect();
         let compound = !rules.is_empty();
-        // Resolved (thread id, category keyword, configured actions).
-        let mut resolved: Vec<(i64, Option<String>, Vec<AiAutomationAction>)> = Vec::new();
+        let model = cfg.model.clone();
+        // Resolved (thread id, category keyword). The category only selects a
+        // local view tab; it never mutates the mailbox.
+        let mut resolved: Vec<(i64, Option<String>)> = Vec::new();
+        // Siftmail: AI may only suggest. Rules the model selects become
+        // pending, non-executable suggestions (see `crate::suggest`).
+        let mut suggestions: Vec<suggest::Suggestion> = Vec::new();
         let mut decided: std::collections::HashMap<String, Option<autolabel::Category>> =
             std::collections::HashMap::new();
         let mut cache_writes: Vec<(String, String)> = Vec::new();
@@ -6757,20 +6764,10 @@ impl Core {
                 match ai::chat(&cfg, msgs).await {
                     Ok(out) => {
                         let decision = route::parse_automation_decision(&out);
-                        let selected: std::collections::HashSet<&str> =
-                            decision.rule_ids.iter().map(String::as_str).collect();
-                        // Preserve the user's rule/action order, not the model's
-                        // output order, so compound behavior is deterministic.
-                        let actions = rules
-                            .iter()
-                            .filter(|rule| selected.contains(rule.id.as_str()))
-                            .flat_map(|rule| rule.actions.iter().cloned())
-                            .collect();
-                        resolved.push((
-                            tid,
-                            decision.category.map(|c| c.keyword().to_string()),
-                            actions,
+                        suggestions.extend(route::suggestions_from_decision(
+                            tid, &decision, &rules, &model,
                         ));
+                        resolved.push((tid, decision.category.map(|c| c.keyword().to_string())));
                     }
                     Err(e) => {
                         tracing::warn!("ai automation failed for thread {tid}: {e}");
@@ -6808,14 +6805,11 @@ impl Core {
                     }
                 }
             };
-            resolved.push((tid, category.map(|c| c.keyword().to_string()), Vec::new()));
+            resolved.push((tid, category.map(|c| c.keyword().to_string())));
         }
 
-        let action_plans: Vec<(i64, Vec<AiAutomationAction>)> = resolved
-            .iter()
-            .map(|(tid, _, actions)| (*tid, actions.clone()))
-            .collect();
-        // One write pass: apply category/tab routing and local annotations.
+        // One write pass: category tab routing + pending suggestions. No AI
+        // output reaches perform_action, labels, flags or local annotations.
         let count = self
             .db
             .write(move |conn| {
@@ -6824,7 +6818,7 @@ impl Core {
                     route::cache_put(conn, domain, key)?;
                 }
                 let mut count = 0i64;
-                for (tid, kw, actions) in &resolved {
+                for (tid, kw) in &resolved {
                     let key = match kw {
                         Some(k) => {
                             let id: Option<i64> = conn
@@ -6839,103 +6833,13 @@ impl Core {
                         None => None,
                     };
                     route::apply_tab(conn, *tid, key.as_deref())?;
-
-                    let mut prefixes = Vec::new();
-                    let mut notes = Vec::new();
-                    for action in actions {
-                        match action.kind.as_str() {
-                            "route_to" if valid_automation_route(conn, &action.value)? => {
-                                route::apply_tab(conn, *tid, Some(&action.value))?;
-                            }
-                            "subject_prefix" if !action.value.trim().is_empty() => {
-                                prefixes.push(action.value.as_str());
-                            }
-                            "body_note" if !action.value.trim().is_empty() => {
-                                notes.push(action.value.trim());
-                            }
-                            _ => {}
-                        }
-                    }
-                    if !prefixes.is_empty() || !notes.is_empty() {
-                        conn.execute(
-                            "UPDATE messages
-                             SET local_subject_prefix = ?2, local_body_note = ?3
-                             WHERE id = (SELECT id FROM messages
-                                         WHERE thread_id = ?1 AND is_outgoing = 0 AND is_draft = 0
-                                         ORDER BY date DESC LIMIT 1)",
-                            rusqlite::params![tid, prefixes.concat(), notes.join("\n\n")],
-                        )?;
-                    }
                     count += 1;
                 }
+                suggest::record(conn, &suggestions)?;
                 Ok(count)
             })
             .await?;
 
-        // Threads that just gained a label may now satisfy a label-based split
-        // rule, so re-check their split routing once the labels are written.
-        let relabeled: Vec<i64> = action_plans
-            .iter()
-            .filter(|(_, actions)| actions.iter().any(|a| a.kind == "add_label"))
-            .map(|(tid, _)| *tid)
-            .collect();
-
-        // Mailbox mutations reuse the normal optimistic + queued action path,
-        // so IMAP state, retries, and UI refreshes behave exactly like a click.
-        for (thread_id, actions) in action_plans {
-            for action in actions {
-                let (kind, params) = match action.kind.as_str() {
-                    "mark_read" => (Some(ActionKind::MarkRead), None),
-                    "star" => (Some(ActionKind::Star), None),
-                    "archive" => (Some(ActionKind::Archive), None),
-                    "trash" => (Some(ActionKind::Trash), None),
-                    "add_label" | "remove_label" => {
-                        let Some(label_id) = action.value.parse::<i64>().ok() else {
-                            continue;
-                        };
-                        let kind = if action.kind == "add_label" {
-                            ActionKind::AddLabel
-                        } else {
-                            ActionKind::RemoveLabel
-                        };
-                        (
-                            Some(kind),
-                            Some(ActionParams {
-                                wake_at: None,
-                                target_folder_id: None,
-                                label_id: Some(label_id),
-                            }),
-                        )
-                    }
-                    _ => (None, None),
-                };
-                let Some(kind) = kind else { continue };
-                if let Err(e) = self
-                    .perform_action(PerformActionArgs {
-                        kind,
-                        thread_ids: vec![thread_id],
-                        params,
-                    })
-                    .await
-                {
-                    tracing::warn!(
-                        "automation action {} failed for thread {thread_id}: {e}",
-                        action.kind
-                    );
-                }
-            }
-        }
-        if !relabeled.is_empty() {
-            self.db
-                .write(move |conn| {
-                    let splits = repo::splits::list(conn)?;
-                    for tid in relabeled {
-                        route::reapply_splits_only(conn, &splits, tid)?;
-                    }
-                    Ok(())
-                })
-                .await?;
-        }
         self.bus.emit(CoreEvent::MailUpdated { thread_ids: vec![] });
         Ok(count)
     }
@@ -7606,26 +7510,6 @@ fn apply_oauth_settings(settings: &Settings) {
         &settings.ms_client_id,
         &settings.ms_client_secret,
     );
-}
-
-/// Validate a model-selected route against current local rows. The model only
-/// receives configured values, but this protects stale/deleted targets too.
-fn valid_automation_route(conn: &rusqlite::Connection, target: &str) -> Result<bool> {
-    if matches!(target, "important" | "other") {
-        return Ok(true);
-    }
-    let (table, id) = if let Some(id) = target.strip_prefix("split:") {
-        ("split_rules", id)
-    } else if let Some(id) = target.strip_prefix("label:") {
-        ("labels", id)
-    } else {
-        return Ok(false);
-    };
-    let Some(id) = id.parse::<i64>().ok() else {
-        return Ok(false);
-    };
-    let sql = format!("SELECT EXISTS (SELECT 1 FROM {table} WHERE id = ?1)");
-    Ok(conn.query_row(&sql, rusqlite::params![id], |row| row.get::<_, i64>(0))? != 0)
 }
 
 /// Optimistic local mutation + enqueue, in one transaction.

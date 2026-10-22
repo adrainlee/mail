@@ -15,6 +15,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("migrations/010_folder_hierarchy.sql"),
     include_str!("migrations/011_pending_body_page.sql"),
     include_str!("migrations/012_sender_identity_sources.sql"),
+    include_str!("migrations/013_ai_suggestions.sql"),
 ];
 pub const LATEST_VERSION: i64 = MIGRATIONS.len() as i64;
 
@@ -106,6 +107,7 @@ mod tests {
         let conn = fresh();
         let expected = [
             "accounts",
+            "ai_suggestions",
             "ai_usage_events",
             "app_settings",
             "attachment_files_fts",
