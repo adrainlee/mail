@@ -1,6 +1,6 @@
 [workspace]
 members = ["crates/flectar-mail-core", "crates/renderer-probe"]
-exclude = ["crates/candle-core", "crates/blitz-dom", "crates/blitz-paint", "crates/parley", "crates/parley_emoji"]
+exclude = ["vendor/jmap-client", "crates/candle-core", "crates/blitz-dom", "crates/blitz-paint", "crates/parley", "crates/parley_emoji"]
 resolver = "3"
 
 [workspace.dependencies]
@@ -19,6 +19,8 @@ blitz-dom = { path = "crates/blitz-dom" }
 blitz-paint = { path = "crates/blitz-paint" }
 # Slint still uses Parley 0.11.1; Blitz's Parley 0.12 is already fixed upstream.
 parley = { path = "crates/parley" }
+# Siftmail: per-account proxy support for JMAP (adds ClientBuilder::proxy).
+jmap-client = { path = "vendor/jmap-client" }
 
 [package]
 name = "flectar-mail"

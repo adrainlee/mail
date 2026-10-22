@@ -106,13 +106,16 @@ struct HistoryPage {
 
 impl GmailApi {
     fn new(ctx: SyncCtx, account: AccountConfig) -> Result<Self> {
-        let http = Client::builder()
+        let builder = Client::builder()
             .connect_timeout(std::time::Duration::from_secs(10))
             .timeout(HTTP_TIMEOUT)
             .redirect(reqwest::redirect::Policy::none())
-            .user_agent(concat!("Flectar-Mail/", env!("CARGO_PKG_VERSION")))
-            .build()
-            .map_err(|error| CoreError::Network(error.to_string()))?;
+            .user_agent(concat!("Flectar-Mail/", env!("CARGO_PKG_VERSION")));
+        // Siftmail: Gmail API traffic leaves through the account's proxy.
+        let http =
+            crate::net::proxy::with_proxy(builder, account.settings.connection.proxy.as_ref())?
+                .build()
+                .map_err(|error| CoreError::Network(error.to_string()))?;
         Ok(Self { http, ctx, account })
     }
 

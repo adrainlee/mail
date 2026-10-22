@@ -238,21 +238,20 @@ impl Core {
                 name: a.name.clone(),
             })
             .collect();
-        graph::create_calendar_event(
-            &token,
-            None,
-            &graph::GraphEvent {
-                subject: args.summary.trim(),
-                body_html,
-                location: args.location.as_deref(),
-                start_ms: args.starts_at,
-                end_ms: args.ends_at,
-                all_day: args.all_day,
-                attendees,
-            },
-        )
-        .await
-        .map(|_| ())
+        let event = graph::GraphEvent {
+            subject: args.summary.trim(),
+            body_html,
+            location: args.location.as_deref(),
+            start_ms: args.starts_at,
+            end_ms: args.ends_at,
+            all_day: args.all_day,
+            attendees,
+        };
+        let create = graph::create_calendar_event(&token, None, &event);
+        crate::net::proxy::ACCOUNT_SCOPE
+            .scope(account_id, create)
+            .await
+            .map(|_| ())
     }
 
     /// Answer an invite: store our response and email an ICS METHOD:REPLY to
@@ -613,7 +612,9 @@ impl Core {
             let access_token = google_access_token.as_deref().ok_or_else(|| {
                 CoreError::CalDav("Google calendar authentication was not initialized".into())
             })?;
-            let listed = googlecal::list_calendars(access_token).await?;
+            let listed = crate::net::proxy::ACCOUNT_SCOPE
+                .scope(account_id, googlecal::list_calendars(access_token))
+                .await?;
             if listed.is_empty() {
                 return Err(CoreError::CalDav("no Google calendars found".into()));
             }
@@ -841,7 +842,12 @@ impl Core {
                 open_url,
             )
             .await?;
-        graph::create_online_meeting(&token, subject, start_ms, end_ms).await
+        crate::net::proxy::ACCOUNT_SCOPE
+            .scope(
+                account_id,
+                graph::create_online_meeting(&token, subject, start_ms, end_ms),
+            )
+            .await
     }
 
     /// Microsoft calendar connection: Outlook / Microsoft 365 has no CalDAV
@@ -857,7 +863,9 @@ impl Core {
         let token = self
             .graph_token_with_consent(account_id, oauth::providers::MS_CALENDARS_SCOPE, open_url)
             .await?;
-        let discovered = graph::list_calendars(&token).await?;
+        let discovered = crate::net::proxy::ACCOUNT_SCOPE
+            .scope(account_id, graph::list_calendars(&token))
+            .await?;
         if discovered.is_empty() {
             return Err(CoreError::CalDav("no calendars found".into()));
         }

@@ -66,6 +66,9 @@ export global SiftmailBridge {
     callback set-global-proxy(int /* index into proxy-names with 0 = none */);
     callback set-account-proxy(int /* account id */, int /* mode */, int /* proxy index */);
     callback test-proxy(int /* proxy id */, string /* host */, string /* port */);
+    // Dials the account's own server through its current proxy choice.
+    callback test-account-proxy(int /* account id */);
+    in-out property <string> account-proxy-result: "";
 
     // Embedding provider
     out property <[string]> embedding-kinds: ["Ollama", @tr("OpenAI-compatible"), @tr("Local (built-in)")];
@@ -250,7 +253,7 @@ export component ProxiesPanel inherits VerticalLayout {
                 spacing: 6px;
                 alignment: end;
                 Button { text: @tr("Save"); clicked => { SiftmailBridge.save-proxy(p.id, pname.text, pkind.current-index, phost.text, pport.text, puser.text, ppass.text, ppass.text != ""); ppass.text = ""; } }
-                Button { text: @tr("Test"); clicked => { SiftmailBridge.test-proxy(p.id, "imap.gmail.com", "993"); } }
+                Button { text: @tr("Test"); clicked => { SiftmailBridge.test-proxy(p.id, "", ""); } }
                 Button { text: @tr("Delete"); destructive: true; clicked => { SiftmailBridge.delete-proxy(p.id); } }
             }
         }
@@ -281,8 +284,26 @@ export component ProxiesPanel inherits VerticalLayout {
             Text { text: a.email; horizontal-stretch: 1; vertical-alignment: center; color: AppTheme.body; overflow: elide; }
             amode := ComboBox { model: SiftmailBridge.proxy-modes; current-index: a.mode-index; width: 150px; selected => { if self.current-index != 2 { SiftmailBridge.set-account-proxy(a.account-id, self.current-index, 0); } } }
             aproxy := ComboBox { model: SiftmailBridge.proxy-names; current-index: a.proxy-index; width: 180px; enabled: amode.current-index == 2; selected => { SiftmailBridge.set-account-proxy(a.account-id, 2, self.current-index); } }
+            Button { text: @tr("Test"); clicked => { SiftmailBridge.test-account-proxy(a.account-id); } }
         }
+        if SiftmailBridge.account-proxy-result != "" : Text { text: SiftmailBridge.account-proxy-result; color: AppTheme.secondary; wrap: word-wrap; }
         Text { text: @tr("Changes apply on the account's next connection."); color: AppTheme.muted; font-size: TypeScale.secondary; }
+    }
+}
+
+/// Compact per-account proxy choice for the regular account list in
+/// Settings → Accounts (same data as the Siftmail proxy page).
+export component AccountProxyControl inherits HorizontalLayout {
+    in property <int> account-id;
+    spacing: 6px;
+    height: 30px;
+    init => { if SiftmailBridge.account-proxies.length == 0 { SiftmailBridge.refresh-proxies(); } }
+    for a in SiftmailBridge.account-proxies : HorizontalLayout {
+        spacing: 6px;
+        if a.account-id == root.account-id : Text { text: @tr("Proxy"); color: AppTheme.secondary; font-size: TypeScale.caption; vertical-alignment: center; }
+        if a.account-id == root.account-id : ComboBox { model: SiftmailBridge.proxy-modes; current-index: a.mode-index; width: 130px; selected => { if self.current-index != 2 { SiftmailBridge.set-account-proxy(a.account-id, self.current-index, 0); } } }
+        if a.account-id == root.account-id && a.mode-index == 2 : ComboBox { model: SiftmailBridge.proxy-names; current-index: a.proxy-index; width: 150px; selected => { SiftmailBridge.set-account-proxy(a.account-id, 2, self.current-index); } }
+        if a.account-id == root.account-id : Button { text: @tr("Test"); height: 28px; clicked => { SiftmailBridge.test-account-proxy(a.account-id); } }
     }
 }
 

@@ -598,19 +598,25 @@ fn register_proxies(ctx: &Ctx, bridge: &SiftmailBridge) {
 
     let c = ctx.clone();
     bridge.on_test_proxy(move |id, host, port| {
-        let host = host.to_string();
-        let port = port.trim().parse::<u16>().unwrap_or(993);
-        let target = format!("{host}:{port}");
-        if let Some(app) = c.app.upgrade() {
-            app.global::<SiftmailBridge>()
-                .set_proxy_test_result(format!("Testing via proxy → {target}…").into());
-        }
+        let host = host.trim().to_string();
+        let port = port.trim().parse::<u16>().ok();
+        set_proxy_status(&c, true, "Testing against your accounts' servers…".into());
         let weak = c.app.clone();
         let Some(core) = c.core() else { return };
-        let task = c.runtime.spawn(async move { core.test_proxy(i64::from(id), host, port).await });
+        let task = c.runtime.spawn(async move {
+            match (host.is_empty(), port) {
+                (false, Some(port)) => {
+                    let t = format!("{host}:{port}");
+                    core.test_proxy(i64::from(id), host, port)
+                        .await
+                        .map(|ms| vec![(t, Ok(ms))])
+                }
+                _ => core.test_proxy_for_accounts(i64::from(id)).await,
+            }
+        });
         let _ = slint::spawn_local(async move {
             let text = match task.await {
-                Ok(Ok(ms)) => format!("OK: reached {target} through the proxy in {ms} ms."),
+                Ok(Ok(rows)) => proxy_test_lines(&rows),
                 Ok(Err(e)) => format!("Failed: {e}"),
                 Err(e) => format!("Failed: {e}"),
             };
@@ -620,6 +626,51 @@ fn register_proxies(ctx: &Ctx, bridge: &SiftmailBridge) {
             }
         });
     });
+
+    let c = ctx.clone();
+    bridge.on_test_account_proxy(move |account_id| {
+        set_proxy_status(&c, false, "Testing the account's server…".into());
+        let weak = c.app.clone();
+        let Some(core) = c.core() else { return };
+        let task = c
+            .runtime
+            .spawn(async move { core.test_account_proxy(i64::from(account_id), None).await });
+        let _ = slint::spawn_local(async move {
+            let text = match task.await {
+                Ok(Ok((target, ms))) => format!("OK: reached {target} in {ms} ms."),
+                Ok(Err(e)) => format!("Failed: {e}"),
+                Err(e) => format!("Failed: {e}"),
+            };
+            if let Some(app) = weak.upgrade() {
+                app.global::<SiftmailBridge>()
+                    .set_account_proxy_result(text.into());
+            }
+        });
+    });
+}
+
+fn set_proxy_status(ctx: &Ctx, shared: bool, text: String) {
+    if let Some(app) = ctx.app.upgrade() {
+        let b = app.global::<SiftmailBridge>();
+        if shared {
+            b.set_proxy_test_result(text.into());
+        } else {
+            b.set_account_proxy_result(text.into());
+        }
+    }
+}
+
+/// One line per dialed server for the proxy test result.
+pub(super) fn proxy_test_lines(
+    rows: &[(String, flectar_mail_core::error::Result<u64>)],
+) -> String {
+    rows.iter()
+        .map(|(t, r)| match r {
+            Ok(ms) => format!("OK: reached {t} through the proxy in {ms} ms."),
+            Err(e) => format!("Failed: {t}: {e}"),
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 // ---- embeddings -------------------------------------------------------

@@ -228,14 +228,20 @@ pub fn normalize_base_url(value: &str, email: &str) -> Result<String> {
 }
 
 pub async fn connect(config: &AccountConfig, secret: &str) -> Result<ConnectedClient> {
-    connect_with(
-        &config.email,
-        &config.username,
-        secret,
-        &config.jmap_url,
-        config.jmap_account_id.as_deref(),
-    )
-    .await
+    // Siftmail: every JMAP request of this account uses its proxy.
+    crate::net::proxy::remember_account_proxy(config.id, config.settings.connection.proxy.clone());
+    crate::net::proxy::ACCOUNT_SCOPE
+        .scope(
+            config.id,
+            connect_with(
+                &config.email,
+                &config.username,
+                secret,
+                &config.jmap_url,
+                config.jmap_account_id.as_deref(),
+            ),
+        )
+        .await
 }
 
 pub async fn connect_with(
@@ -248,6 +254,11 @@ pub async fn connect_with(
     let base_url = normalize_base_url(server, email)?;
     let url = Url::parse(&base_url)
         .map_err(|error| CoreError::Auth(format!("invalid JMAP server address: {error}")))?;
+    let proxy = crate::net::proxy::scoped_proxy();
+    let http_proxy = proxy
+        .as_ref()
+        .map(crate::net::proxy::reqwest_proxy)
+        .transpose()?;
     let (connect_base, session_url) = discover_connection_base(&url).await?;
     let host = connect_base.host_str().unwrap_or_default().to_owned();
     let username = if username.trim().is_empty() {
@@ -277,36 +288,43 @@ pub async fn connect_with(
         (AuthenticationScheme::Basic, true) => Some(AuthenticationScheme::Bearer),
         (AuthenticationScheme::Basic, false) => None,
     };
-    let mut client =
-        match connect_authenticated(connect_base.as_str(), &host, username, secret, first_scheme)
+    let mut client = match connect_authenticated(
+        connect_base.as_str(),
+        &host,
+        username,
+        secret,
+        first_scheme,
+        http_proxy.clone(),
+    )
+    .await
+    {
+        Ok(client) => {
+            remember_authentication_scheme(&cache_key, first_scheme);
+            client
+        }
+        Err(error) if is_unauthorized(&error) => {
+            let Some(second_scheme) = second_scheme else {
+                return Err(map_error(error));
+            };
+            match connect_authenticated(
+                connect_base.as_str(),
+                &host,
+                username,
+                secret,
+                second_scheme,
+                http_proxy.clone(),
+            )
             .await
-        {
-            Ok(client) => {
-                remember_authentication_scheme(&cache_key, first_scheme);
-                client
-            }
-            Err(error) if is_unauthorized(&error) => {
-                let Some(second_scheme) = second_scheme else {
-                    return Err(map_error(error));
-                };
-                match connect_authenticated(
-                    connect_base.as_str(),
-                    &host,
-                    username,
-                    secret,
-                    second_scheme,
-                )
-                .await
-                {
-                    Ok(client) => {
-                        remember_authentication_scheme(&cache_key, second_scheme);
-                        client
-                    }
-                    Err(error) => return Err(map_error(error)),
+            {
+                Ok(client) => {
+                    remember_authentication_scheme(&cache_key, second_scheme);
+                    client
                 }
+                Err(error) => return Err(map_error(error)),
             }
-            Err(error) => return Err(map_error(error)),
-        };
+        }
+        Err(error) => return Err(map_error(error)),
+    };
 
     let session = client.session();
     if !session.has_capability(CORE_CAPABILITY) || !session.has_capability(MAIL_CAPABILITY) {
@@ -366,13 +384,16 @@ pub async fn connect_with(
     client.set_default_account_id(account_id.clone());
     let mut download_headers = client.headers().clone();
     download_headers.remove(reqwest::header::CONTENT_TYPE);
-    let download_http = reqwest::Client::builder()
-        .connect_timeout(std::time::Duration::from_secs(10))
-        .timeout(std::time::Duration::from_secs(30))
-        .redirect(reqwest::redirect::Policy::none())
-        .default_headers(download_headers)
-        .build()
-        .map_err(|error| CoreError::Network(format!("JMAP download client failed: {error}")))?;
+    let download_http = crate::net::proxy::with_proxy(
+        reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .timeout(std::time::Duration::from_secs(30))
+            .redirect(reqwest::redirect::Policy::none())
+            .default_headers(download_headers),
+        proxy.as_ref(),
+    )?
+    .build()
+    .map_err(|error| CoreError::Network(format!("JMAP download client failed: {error}")))?;
 
     Ok(ConnectedClient {
         client,
@@ -430,11 +451,14 @@ async fn discover_session_url(base_url: &Url) -> Result<Url> {
 }
 
 async fn resolve_session_url(mut current: Url, allow_local_http: bool) -> Result<Url> {
-    let http = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .map_err(|error| CoreError::Network(format!("JMAP discovery client failed: {error}")))?;
+    let http = crate::net::proxy::with_proxy(
+        reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .redirect(reqwest::redirect::Policy::none()),
+        crate::net::proxy::scoped_proxy().as_ref(),
+    )?
+    .build()
+    .map_err(|error| CoreError::Network(format!("JMAP discovery client failed: {error}")))?;
     for redirect_count in 0..=MAX_DISCOVERY_REDIRECTS {
         let response = http
             .get(current.clone())
@@ -492,19 +516,22 @@ async fn connect_authenticated(
     username: &str,
     secret: &str,
     scheme: AuthenticationScheme,
+    proxy: Option<reqwest::Proxy>,
 ) -> std::result::Result<Client, jmap_client::Error> {
     let credentials = match scheme {
         AuthenticationScheme::Bearer => Credentials::bearer(secret),
         AuthenticationScheme::Basic => Credentials::basic(username, secret),
     };
-    Client::new()
+    let mut builder = Client::new()
         .credentials(credentials)
         .timeout(std::time::Duration::from_secs(30))
         // Public cross-host redirects are resolved before authentication.
         // The library may follow same-host redirects from this well-known URL.
-        .follow_redirects([host])
-        .connect(base_url.trim_end_matches('/'))
-        .await
+        .follow_redirects([host]);
+    if let Some(p) = proxy {
+        builder = builder.proxy(p);
+    }
+    builder.connect(base_url.trim_end_matches('/')).await
 }
 
 fn is_authentication_rejection(error: &jmap_client::Error) -> bool {
