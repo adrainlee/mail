@@ -54,6 +54,7 @@ mod renderer_preferences;
 mod retained_model;
 mod rich_compose;
 mod settings_controller;
+mod siftmail_controller;
 mod sidebar_model;
 #[cfg(desktop)]
 mod single_instance;
@@ -7055,6 +7056,7 @@ pub fn run(platform: PlatformContext) -> Result<(), Box<dyn std::error::Error>> 
     });
 
     settings_controller::register_oauth_settings_callbacks(&app, &state, &runtime);
+    siftmail_controller::register(&app, &state, &runtime);
 
     register_data_management_callbacks(
         &app,
