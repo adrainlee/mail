@@ -248,6 +248,41 @@ impl Core {
         Ok((target, ms))
     }
 
+    /// Siftmail: test a shared proxy against the servers of the accounts
+    /// that use it (or, when none does yet, the first account's server), so
+    /// the result reflects real traffic rather than a fixed public host.
+    /// Returns the dialed target and round-trip time.
+    pub async fn test_proxy_for_accounts(&self, id: i64) -> Result<Vec<(String, Result<u64>)>> {
+        let (users, first) = self
+            .db
+            .read(move |conn| {
+                let all = repo::accounts::list_configs(conn)?;
+                let users: Vec<(String, u16)> = all
+                    .iter()
+                    .filter(|c| c.settings.connection.proxy.as_ref().map(|p| p.id) == Some(id))
+                    .map(proxy::account_endpoint)
+                    .collect();
+                Ok((users, all.first().map(proxy::account_endpoint)))
+            })
+            .await?;
+        let mut targets = users;
+        targets.dedup();
+        if targets.is_empty() {
+            targets.extend(first);
+        }
+        if targets.is_empty() {
+            return Err(CoreError::Other(
+                "add an account first: the test dials the account's own mail server".into(),
+            ));
+        }
+        let mut out = Vec::new();
+        for (host, port) in targets.into_iter().take(5) {
+            let r = self.test_proxy(id, host.clone(), port).await;
+            out.push((format!("{host}:{port}"), r));
+        }
+        Ok(out)
+    }
+
     /// Dial `host:port` through a saved proxy (with its stored password).
     pub async fn test_proxy(&self, id: i64, host: String, port: u16) -> Result<u64> {
         let mut p = self

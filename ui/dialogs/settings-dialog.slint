@@ -18,7 +18,7 @@ import { FormField, SettingsCard, SettingsLinkRow, SettingsNavItem, SettingsSele
 import { RuntimeColorPicker, ThemeEditor } from "../components/theme-editor.slint";
 import { TypeScale } from "../typography.slint";
 import { AppTheme, LayoutMetrics, SettingsIconPalette, ServiceIconPalette } from "../design-system.slint";
-import { SiftmailPage, SiftmailBridge } from "../views/siftmail-panels.slint";
+import { AccountProxyControl, SiftmailPage, SiftmailBridge } from "../views/siftmail-panels.slint";
 import { CompactPageHeader, WorkspaceSidebarSurface } from "../components/workspace-layout.slint";
 
 // Use the same focusable controls in both account-card layouts.
@@ -1801,6 +1801,8 @@ export component SettingsDialog inherits Rectangle {
                                             account-name := Text { height: max(19px, self.preferred-height); text: account.name; color: root.heading; font-size: TypeScale.body-large; font-weight: 700; overflow: elide; }
                                             account-email := Text { height: max(16px, self.preferred-height); text: account.email; color: root.secondary-text; font-size: TypeScale.caption; overflow: elide; }
                                             account-state := Text { height: max(16px, self.preferred-height); text: account.status == "offline" ? @tr("Offline · retrying automatically") : account.status == "needs_reauth" ? @tr("Sign-in required") : account.status == "syncing" ? @tr("Syncing…") : account.status == "idle" ? (account.mail_protocol == "jmap" ? @tr("Connected · JMAP") : @tr("Connected · IMAP + SMTP")) : @tr("Account status: {}", account.status); color: account.status == "needs_reauth" ? #c0392b : root.faint-text; font-size: TypeScale.caption; overflow: elide; }
+                                            // Siftmail: per-account proxy choice right on the account card.
+                                            if !root.compact : AccountProxyControl { account-id: account.id; }
                                         }
                                         AccountActions {
                                             edit-label: account.provider == "imap" ? @tr("Edit") : @tr("Reconnect");
