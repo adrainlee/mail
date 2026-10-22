@@ -13,6 +13,7 @@ mod labels;
 mod notifications;
 mod outbox;
 mod proxies;
+pub(crate) mod scheduler_status;
 mod search_ask;
 mod settings;
 mod snippets;

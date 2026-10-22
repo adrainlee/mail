@@ -56,6 +56,87 @@ pub fn provider_key(host: &str) -> String {
     labels[n - take..].join(".")
 }
 
+/// Provider key for any account type, so IMAP, Gmail API and JMAP accounts
+/// on one provider share a single backoff and permit pool.
+pub fn account_provider_key(config: &crate::models::AccountConfig) -> String {
+    use crate::models::{MailProtocol, Provider};
+    if config.provider == Provider::Gmail {
+        return "gmail.com".into();
+    }
+    if config.mail_protocol == MailProtocol::Jmap {
+        let host = reqwest::Url::parse(&config.jmap_url)
+            .ok()
+            .and_then(|u| u.host_str().map(str::to_owned))
+            .unwrap_or_default();
+        if !host.is_empty() {
+            return provider_key(&host);
+        }
+    }
+    provider_key(&config.imap_host)
+}
+
+/// Delay until the next regular cycle: the account's jittered poll schedule
+/// when polling, otherwise `push_fallback` (the app-wide interval used as a
+/// safety net while a push channel is open).
+pub fn next_cycle_delay(
+    schedule: &crate::models::SyncSchedule,
+    push_fallback: Duration,
+    rng: &mut impl Rng,
+) -> Duration {
+    if schedule.idle_push {
+        push_fallback
+    } else {
+        jittered_interval(schedule.base(), schedule.jitter(), rng)
+    }
+}
+
+/// Remaining provider backoff, if any (read from the persisted table).
+pub async fn backoff_remaining(
+    db: &crate::db::Db,
+    provider: &str,
+) -> Option<(Duration, BackoffState)> {
+    let p = provider.to_string();
+    let state = db
+        .read(move |conn| get_backoff(conn, &p))
+        .await
+        .ok()
+        .flatten()?;
+    state.remaining(crate::models::now_ms()).map(|d| (d, state))
+}
+
+/// Record a cycle's outcome for the provider. Returns `true` when the error
+/// put the provider into backoff.
+pub async fn record_cycle(
+    db: &crate::db::Db,
+    provider: &str,
+    outcome: std::result::Result<(), &CoreError>,
+) -> bool {
+    let p = provider.to_string();
+    match outcome {
+        Ok(()) => {
+            let _ = db
+                .write(move |conn| record_success(conn, &p, crate::models::now_ms()))
+                .await;
+            false
+        }
+        Err(e) if classify_failure(e) == FailureKind::ProviderThrottle => {
+            let message = e.to_string();
+            db.write(move |conn| {
+                record_throttle(
+                    conn,
+                    &p,
+                    &message,
+                    crate::models::now_ms(),
+                    &mut rand::rng(),
+                )
+            })
+            .await
+            .is_ok()
+        }
+        Err(_) => false,
+    }
+}
+
 /// How a connect/cycle failure should be scheduled.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FailureKind {
@@ -392,5 +473,48 @@ mod tests {
         )
         .await
         .expect("permit released");
+    }
+
+    #[test]
+    fn every_account_type_has_a_provider_key() {
+        use crate::models::{AccountConfig, AuthKind, MailProtocol, Provider};
+        let mut c = AccountConfig {
+            id: 1,
+            email: "a@x".into(),
+            display_name: None,
+            avatar_url: None,
+            provider: Provider::Gmail,
+            auth_kind: AuthKind::Oauth2,
+            mail_protocol: MailProtocol::Imap,
+            username: "a".into(),
+            jmap_url: String::new(),
+            jmap_account_id: None,
+            imap_host: String::new(),
+            imap_port: 993,
+            smtp_host: String::new(),
+            smtp_port: 465,
+            settings: Default::default(),
+        };
+        assert_eq!(account_provider_key(&c), "gmail.com");
+        c.provider = Provider::Imap;
+        c.mail_protocol = MailProtocol::Jmap;
+        c.jmap_url = "https://mail.fastmail.com/jmap".into();
+        assert_eq!(account_provider_key(&c), "fastmail.com");
+        c.mail_protocol = MailProtocol::Imap;
+        c.imap_host = "imap.example.co.uk".into();
+        assert_eq!(account_provider_key(&c), "example.co.uk");
+    }
+
+    #[test]
+    fn next_cycle_delay_polls_on_schedule_or_uses_push_fallback() {
+        let mut rng = StdRng::seed_from_u64(7);
+        let mut s = crate::models::SyncSchedule::default();
+        let d = next_cycle_delay(&s, Duration::from_secs(5), &mut rng);
+        assert!(d >= Duration::from_secs(40 * 60) && d <= Duration::from_secs(80 * 60));
+        s.idle_push = true;
+        assert_eq!(
+            next_cycle_delay(&s, Duration::from_secs(5), &mut rng),
+            Duration::from_secs(5)
+        );
     }
 }

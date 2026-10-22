@@ -68,6 +68,18 @@ async fn actor(
     let mut waiters = Vec::new();
     let mut retry = 1u64;
     let mut identities_synced_at: Option<std::time::Instant> = None;
+    // Siftmail M1.5 scheduling, shared with IMAP/Gmail (sync/scheduler.rs).
+    let provider = crate::sync::scheduler::account_provider_key(&config);
+    if ctx.startup_stagger {
+        let delay = crate::sync::scheduler::startup_delay(&mut rand::rng());
+        match tokio::time::timeout(delay, rx.recv()).await {
+            Ok(None) | Ok(Some(SyncCmd::Shutdown)) => return,
+            Ok(Some(SyncCmd::SyncNow {
+                complete: Some(done),
+            })) => waiters.push(done),
+            _ => {}
+        }
+    }
     loop {
         while let Ok(cmd) = rx.try_recv() {
             match cmd {
@@ -81,6 +93,28 @@ async fn actor(
         if settings.has_changed().unwrap_or(false) {
             config.settings = settings.borrow_and_update().clone();
         }
+        if let Some((wait, state)) =
+            crate::sync::scheduler::backoff_remaining(&ctx.db, &provider).await
+        {
+            let message = format!(
+                "provider {provider} backing off (level {}): {}",
+                state.level, state.last_error
+            );
+            set_state_error(&ctx, config.id, "offline", &message).await;
+            match tokio::time::timeout(wait, rx.recv()).await {
+                Ok(None) | Ok(Some(SyncCmd::Shutdown)) => return,
+                Ok(Some(SyncCmd::SyncNow {
+                    complete: Some(done),
+                })) => waiters.push(done),
+                _ => {}
+            }
+        }
+        let schedule = config.settings.sync_schedule;
+        let permit = if schedule.idle_push {
+            None
+        } else {
+            Some(crate::sync::scheduler::acquire_provider_permit(&provider).await)
+        };
         let outcome = async {
             let connected = connect(&ctx, &config).await?;
             persist_session(&ctx, config.id, &connected).await?;
@@ -103,6 +137,10 @@ async fn actor(
             Ok::<ConnectedClient, CoreError>(connected)
         }
         .await;
+        drop(permit);
+        let throttled =
+            crate::sync::scheduler::record_cycle(&ctx.db, &provider, outcome.as_ref().map(|_| ()))
+                .await;
         let connected = match outcome {
             Ok(connected) => {
                 retry = 1;
@@ -121,11 +159,20 @@ async fn actor(
                 set_state_error(&ctx, config.id, "offline", &message).await;
                 ctx.bus.emit(CoreEvent::NetworkState { online: false });
                 finish_waiters(&mut waiters, Err(message));
+                if throttled {
+                    continue;
+                }
                 retry = (retry * 2).min(300);
                 None
             }
         };
-        let normal = configured_sync_interval(&ctx.db).await;
+        let normal = crate::sync::scheduler::next_cycle_delay(
+            &schedule,
+            configured_sync_interval(&ctx.db).await,
+            &mut rand::rng(),
+        );
+        // Push (EventSource) only when the account opted into it.
+        let connected = connected.filter(|_| schedule.idle_push);
         let delay = if retry == 1 {
             normal
         } else {
